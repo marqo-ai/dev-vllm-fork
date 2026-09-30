@@ -44,7 +44,7 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridAttnMetadata
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import prepare_dflash_inputs
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
-from vllm.v1.worker.gpu.spec_decode.uno.draft_norms import DraftNorms
+from vllm.v1.worker.gpu.spec_decode.uno.draft_norms import DraftNorms, compilation_enabled
 from vllm.v1.worker.gpu.spec_decode.uno.draft_weights import KINDS, draft_linear
 from vllm.v1.worker.gpu.spec_decode.uno.gated_lora import GatedLoRA, load_uno_adapter
 from vllm.v1.worker.gpu.spec_decode.uno.isolation import (
@@ -111,7 +111,7 @@ class UnoSpeculator(DraftModelSpeculator):
         # "model": the LoRA delta in the model's dtype, three kernels per
         # module. "float32": in fp32 as in training, about six.
         self.lora_dtype = os.environ.get("VLLM_UNO_LORA_DTYPE", "model")
-        # "fp8" / "int4": the draft forward reads a low-bit copy of every
+        # "fp8" / "int4" / "int4g32": the draft forward reads a low-bit copy of every
         # adapted projection (draft_weights.py). Costs acceptance, never output.
         self.draft_weights = os.environ.get("VLLM_UNO_DRAFT_WEIGHTS", "")
         if self.draft_weights and (
@@ -121,8 +121,12 @@ class UnoSpeculator(DraftModelSpeculator):
                 f"VLLM_UNO_DRAFT_WEIGHTS must be one of {KINDS} and needs "
                 "VLLM_UNO_LORA_DTYPE=model."
             )
-        # "auto": fold A into the draft weight for fp8 only. "1" / "0" force it.
-        self.fold_lora = os.environ.get("VLLM_UNO_FOLD_LORA", "auto")
+        # The Marlin kernels' reduction dtype for the draft weights (see draft_linear).
+        self.draft_fp32_reduce = os.environ.get("VLLM_UNO_DRAFT_FP32_REDUCE", "1") == "1"
+        # Fold the LoRA's A into the draft weight as extra output channels
+        # (one addmm per module instead of a GEMM and an addmm). Measured free
+        # with fp8 and within noise with 4-bit.
+        self.fold_lora = os.environ.get("VLLM_UNO_FOLD_LORA", "1")
         # The draft forward's RMSNorms as one compiled kernel pair each
         # (draft_norms.py); "0" leaves them as the eager fp32 formula.
         self.fused_norms = os.environ.get("VLLM_UNO_FUSED_NORMS", "1") == "1"
@@ -203,10 +207,10 @@ class UnoSpeculator(DraftModelSpeculator):
             self.row_mask,
             self.device,
             None if self.lora_dtype == "float32" else self.dtype,
-            (lambda weight: draft_linear(weight, self.draft_weights))
+            (lambda weight: draft_linear(weight, self.draft_weights, self.draft_fp32_reduce))
             if self.draft_weights
             else None,
-            fold=self.fold_lora == "1" or (self.fold_lora == "auto" and self.draft_weights == "fp8"),
+            fold=bool(self.draft_weights) and self.fold_lora == "1",
             block=self.block if self.draft_weights else None,
             max_rows=self.draft_weights_max_rows if self.draft_weights else None,
         )
@@ -215,7 +219,11 @@ class UnoSpeculator(DraftModelSpeculator):
             for layer in layers
             for norm in (layer.input_layernorm, layer.post_attention_layernorm)
         ] + [self.decoder.norm]
-        self.draft_norms = DraftNorms(norms) if self.fused_norms else None
+        self.draft_norms = (
+            DraftNorms(norms)
+            if self.fused_norms and compilation_enabled(self.vllm_config.compilation_config)
+            else None
+        )
         self.gdn_modules = [
             layer.linear_attn for layer in layers if layer.layer_type == "linear_attention"
         ]
@@ -601,6 +609,10 @@ class UnoSpeculator(DraftModelSpeculator):
             self.draft_tokens[:num_reqs].zero_()
             return self.draft_tokens[:num_reqs]
         t0 = self._lap_start = self._tick()
+        if self.debug_mode == "slow_prepare":
+            # 3 ms of CPU time before the draft is launched: if throughput does
+            # not move, the prepare stage is hidden behind the verify forward.
+            time.sleep(0.003)
 
         # Inputs for [seed, placeholder x (K-1)] per request: ids, positions,
         # sequence lengths, K/V slots in the request's own pages, and the

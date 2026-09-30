@@ -15,6 +15,8 @@ from contextlib import contextmanager
 import torch
 import torch.nn as nn
 
+from vllm.config import CompilationMode
+from vllm.config.compilation import CompilationConfig
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.platforms import current_platform
@@ -37,6 +39,14 @@ def _add_rms_norm(
     variance = out.pow(2).mean(dim=-1, keepdim=True)
     out = out * torch.rsqrt(variance + eps)
     return (out * weight).to(x.dtype), residual
+
+
+def compilation_enabled(compilation_config: CompilationConfig) -> bool:
+    """Whether vLLM compiles at all: without it the swap would gain nothing."""
+    return (
+        compilation_config.mode != CompilationMode.NONE
+        and compilation_config.backend != "eager"
+    )
 
 
 def _compile(fn: Callable) -> Callable:

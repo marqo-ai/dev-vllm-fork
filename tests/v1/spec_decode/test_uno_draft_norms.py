@@ -71,3 +71,17 @@ def test_every_norm_shares_two_compiled_functions():
 def test_only_the_gemma_norm_is_taken():
     with pytest.raises(ValueError, match="LayerNorm"):
         DraftNorms([nn.LayerNorm(HIDDEN)], compile_fn=_same)
+
+
+@pytest.mark.parametrize(
+    "mode,backend,want",
+    [("VLLM_COMPILE", "inductor", True), ("NONE", "inductor", False), ("VLLM_COMPILE", "eager", False)],
+)
+def test_norms_are_only_compiled_when_vllm_compiles(mode, backend, want):
+    from types import SimpleNamespace
+
+    from vllm.config import CompilationMode
+    from vllm.v1.worker.gpu.spec_decode.uno.draft_norms import compilation_enabled
+
+    config = SimpleNamespace(mode=getattr(CompilationMode, mode), backend=backend)
+    assert compilation_enabled(config) is want
