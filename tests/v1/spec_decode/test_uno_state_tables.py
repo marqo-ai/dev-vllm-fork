@@ -91,3 +91,39 @@ def test_inactive_rows_stage_inside_the_null_block_only():
     zero = torch.zeros(2, dtype=torch.int64)
     stage_conv_windows([conv], zero, zero, zero, WIDTH - 1, 3, True)
     assert torch.equal(conv[1:], before[1:])
+
+
+def test_seed_position_follows_the_last_accepted_row():
+    from vllm.v1.worker.gpu.spec_decode.uno.state_tables import draft_seed_positions
+
+    # Two requests verified 9 rows each, at positions 100..108 and 40..48.
+    positions = torch.cat([torch.arange(100, 109), torch.arange(40, 49)])
+    query_start_loc = torch.tensor([0, 9, 18], dtype=torch.int32)
+    # The first rejected 8 rows (one token emitted), the second rejected none.
+    num_rejected = torch.tensor([8, 0], dtype=torch.int32)
+    assert draft_seed_positions(positions, query_start_loc, num_rejected).tolist() == [101, 49]
+
+
+def test_draft_rows_past_the_context_limit_write_no_kv():
+    from vllm.v1.worker.gpu.spec_decode.uno.state_tables import pad_slots_past_limit
+
+    block, limit, pad = 8, 1664, -1
+    slots = torch.arange(100, 100 + 3 * block)
+    before = slots.clone()
+    # Request 0 ends well short of the limit, request 1 crosses it after 2 rows, request 2 starts on it.
+    pad_slots_past_limit(slots, torch.tensor([1000, 1662, 1664]), block, limit, pad)
+    assert torch.equal(slots[:block], before[:block])
+    assert torch.equal(slots[block:block + 2], before[block:block + 2])
+    assert (slots[block + 2:] == pad).all()
+
+
+def test_mrope_positions_add_each_requests_offset_on_every_axis():
+    from vllm.v1.worker.gpu.spec_decode.uno.state_tables import write_mrope_positions
+
+    block = 4
+    positions = torch.tensor([10, 11, 12, 13, 50, 51, 52, 53, 0, 0, 0, 0])   # two requests and one padded block
+    out = torch.full((3, 16), -7, dtype=torch.int64)
+    write_mrope_positions(out, positions, torch.tensor([0, 25], dtype=torch.int32), block)
+    for axis in range(3):
+        assert out[axis, :12].tolist() == [10, 11, 12, 13, 75, 76, 77, 78, 0, 0, 0, 0]
+    assert (out[:, 12:] == -7).all()

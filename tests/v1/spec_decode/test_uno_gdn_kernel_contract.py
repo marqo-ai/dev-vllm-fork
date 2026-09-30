@@ -86,3 +86,77 @@ def test_conv_kernel_reads_the_staged_window_and_never_writes_block_zero(accepte
     expected = torch.zeros(slots, dtype=torch.bool, device=DEV)
     expected[dst] = True
     assert torch.equal(changed, expected)
+
+
+def test_an_inactive_request_touches_no_state_and_leaves_the_others_exact():
+    torch.manual_seed(0)
+    H, HV, K, V = 4, 8, 16, 16
+    real = torch.arange(1, 1 + N * WIDTH, dtype=torch.int32, device=DEV).view(N, WIDTH)
+    acc = torch.tensor([1, 4, WIDTH], dtype=torch.int32, device=DEV)
+    active = torch.tensor([True, False, True], device=DEV)
+    table, _, dst, _ = build_draft_state_table(real, acc, active, WIDTH)
+    slots, tokens = 1 + N * WIDTH, N * W
+    state = torch.randn(slots, HV, V, K, device=DEV)
+    inputs = dict(
+        A_log=torch.randn(HV, device=DEV), dt_bias=torch.randn(HV, device=DEV),
+        a=torch.randn(tokens, HV, device=DEV), b=torch.randn(tokens, HV, device=DEV),
+        q=torch.randn(1, tokens, H, K, device=DEV), k=torch.randn(1, tokens, H, K, device=DEV),
+        v=torch.randn(1, tokens, HV, V, device=DEV),
+        cu_seqlens=(torch.arange(N + 1, device=DEV) * W).to(torch.int32),
+        inplace_final_state=True, use_qk_l2norm_in_kernel=True,
+    )
+    stock_out, _ = fused_sigmoid_gating_delta_rule_update(
+        **inputs, initial_state=state.clone(), ssm_state_indices=real.contiguous(), num_accepted_tokens=acc)
+    draft_state = state.clone()
+    draft_out, _ = fused_sigmoid_gating_delta_rule_update(
+        **inputs, initial_state=draft_state, ssm_state_indices=table.contiguous(),
+        num_accepted_tokens=torch.full((N,), WIDTH, dtype=torch.int32, device=DEV))
+
+    rows = torch.arange(tokens, device=DEV).view(N, W)[active].reshape(-1)
+    assert torch.equal(draft_out[0, rows], stock_out[0, rows])
+    changed = (draft_state != state).flatten(1).any(1)
+    expected = torch.zeros(slots, dtype=torch.bool, device=DEV)
+    expected[dst[active]] = True
+    assert torch.equal(changed, expected)
+
+
+FUSED_W = 7                     # a table of at most 8 columns selects the fused CUDA kernel
+FUSED_WIDTH = FUSED_W + 1
+
+
+@pytest.mark.skipif(not hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp"), reason="no fused GDN kernel in this build")
+@pytest.mark.parametrize("accepted", [[1, 1, 1], [1, 4, FUSED_WIDTH], [2, FUSED_WIDTH, 3]])
+def test_fused_cuda_kernel_reads_the_committed_block_and_never_writes_it(accepted):
+    import vllm._custom_ops as ops
+
+    torch.manual_seed(0)
+    H, HV, D = 2, 4, 128
+    real = torch.arange(1, 1 + N * FUSED_WIDTH, dtype=torch.int32, device=DEV).view(N, FUSED_WIDTH)
+    acc = torch.tensor(accepted, dtype=torch.int32, device=DEV)
+    table, _, dst, _ = build_draft_state_table(real, acc, torch.ones(N, dtype=torch.bool, device=DEV), FUSED_WIDTH)
+    slots, tokens = 1 + N * FUSED_WIDTH, N * FUSED_W
+    state = torch.randn(slots, HV, D, D, device=DEV)
+    bf16 = dict(device=DEV, dtype=torch.bfloat16)
+    inputs = dict(
+        mixed_qkv=torch.randn(tokens, 2 * H * D + HV * D, **bf16),
+        a=torch.randn(tokens, HV, **bf16), b=torch.randn(tokens, HV, **bf16),
+        A_log=torch.randn(HV, device=DEV), dt_bias=torch.randn(HV, device=DEV),
+        cu_seqlens=(torch.arange(N + 1, device=DEV) * FUSED_W).to(torch.int32),
+        output_gate=torch.randn(tokens, HV, D, **bf16), norm_weight=torch.ones(D, device=DEV),
+    )
+
+    def run(indices, num_accepted, state_tensor):
+        out = torch.zeros(tokens, HV, D, **bf16)
+        ops.fused_gdn_decode_post_conv_mtp(
+            **inputs, state_indices=indices.contiguous(), num_accepted_tokens=num_accepted, state=state_tensor, out=out)
+        return out
+
+    stock_out = run(real, acc, state.clone())
+    draft_state = state.clone()
+    draft_out = run(table, torch.full((N,), FUSED_WIDTH, dtype=torch.int32, device=DEV), draft_state)
+
+    assert torch.equal(draft_out, stock_out)
+    changed = (draft_state != state).flatten(1).any(1)
+    expected = torch.zeros(slots, dtype=torch.bool, device=DEV)
+    expected[dst] = True
+    assert torch.equal(changed, expected)

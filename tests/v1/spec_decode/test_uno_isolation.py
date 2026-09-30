@@ -64,3 +64,37 @@ def test_changed_slots_names_the_block_and_token_slot():
     changed = changed_slots(before, view.index_select(0, blocks))
     assert changed.shape == (2, BLOCK_SIZE)
     assert changed.nonzero().tolist() == [[1, 6]]
+
+
+def test_only_the_scratch_block_and_null_blocks_may_change_state():
+    from vllm.v1.worker.gpu.spec_decode.uno.isolation import state_allowed
+
+    real = torch.tensor([[11, 12, 13], [21, 22, 23], [0, 0, 0]])
+    allowed = state_allowed(real, torch.tensor([12, 23, 0]))
+    assert allowed.tolist() == [False, True, False, False, False, True, True, True, True]
+
+
+def test_only_the_draft_positions_may_change_kv():
+    from vllm.v1.worker.gpu.spec_decode.uno.isolation import kv_blocks_and_allowed
+
+    block, block_size = 4, 8
+    table = torch.tensor([[5, 6, 99], [7, 98, 97]])     # columns past a request's last draft row hold stale ids
+    # Request 0 drafts positions 6..9 (crossing into its second block); request 1 drafts 2..5.
+    blocks, allowed = kv_blocks_and_allowed(table, torch.tensor([6, 2]), block, block_size, 100)
+    assert blocks.tolist() == [5, 6, 7, 0]
+    assert allowed[0].nonzero().flatten().tolist() == [6, 7]
+    assert allowed[1].nonzero().flatten().tolist() == [0, 1]
+    assert allowed[2].nonzero().flatten().tolist() == [2, 3, 4, 5]
+    assert allowed[3].all()                             # a null block is a free sink
+
+
+def test_positions_past_the_context_limit_are_not_allowed_to_change_kv():
+    from vllm.v1.worker.gpu.spec_decode.uno.isolation import kv_blocks_and_allowed
+
+    block, block_size, limit = 4, 8, 16
+    table = torch.tensor([[5, 6]])
+    # Drafting 14..17: positions 16 and 17 are past the limit and would wrap into block 6's first slots.
+    blocks, allowed = kv_blocks_and_allowed(table, torch.tensor([14]), block, block_size, limit)
+    assert blocks.tolist() == [5, 6]
+    assert allowed[0].nonzero().numel() == 0
+    assert allowed[1].nonzero().flatten().tolist() == [6, 7]

@@ -39,3 +39,42 @@ def kv_block_view(
 def changed_slots(before: torch.Tensor, after: torch.Tensor) -> torch.Tensor:
     """`[m, block_size, ...]` K/V snapshots -> bool `[m, block_size]`, True where a token slot differs."""
     return (_bits(before) != _bits(after)).flatten(2).any(2)
+
+
+def state_allowed(real: torch.Tensor, scratch: torch.Tensor) -> torch.Tensor:
+    """`[n, width]` state blocks -> flat bool: which blocks the draft may change.
+
+    Only each request's scratch block, and the null block.
+    """
+    return ((real == scratch[:, None]) | (real == 0)).reshape(-1)
+
+
+def kv_blocks_and_allowed(
+    table: torch.Tensor,
+    seed_pos: torch.Tensor,
+    block: int,
+    block_size: int,
+    max_model_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Which K/V blocks to watch, and which of their token slots the draft may change.
+
+    Returns the flat block ids `[n * cols]` of every block that holds a
+    request's prefix or draft rows, and a bool `[n * cols, block_size]` that is
+    True only at the draft's own positions below the context limit. Columns
+    past a request's last draft row can hold stale ids and are replaced by the
+    null block, which may change freely.
+    """
+    num_reqs = table.shape[0]
+    device = table.device
+    positions = seed_pos[:, None] + torch.arange(block, device=device)[None, :]
+    writable = positions < max_model_len
+    last_col = torch.clamp(seed_pos + block - 1, max=max_model_len - 1) // block_size
+    num_cols = min(int(last_col.max().item()) + 1, table.shape[1])
+    cols = torch.arange(num_cols, device=device)
+    owned = cols[None, :] <= last_col[:, None]
+    blocks = torch.where(owned, table[:, :num_cols].to(torch.int64), 0).reshape(-1)
+    rows = torch.arange(num_reqs, device=device)[:, None].expand_as(positions)
+    inside = writable & (positions // block_size < num_cols)
+    allowed = torch.zeros(num_reqs, num_cols, block_size, dtype=torch.bool, device=device)
+    allowed[rows[inside], (positions // block_size)[inside], (positions % block_size)[inside]] = True
+    return blocks, allowed.reshape(-1, block_size) | (blocks == 0)[:, None]

@@ -29,6 +29,7 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -48,14 +49,45 @@ from vllm.v1.worker.gpu.spec_decode.uno.isolation import (
     changed_blocks,
     changed_slots,
     kv_block_view,
+    kv_blocks_and_allowed,
+    state_allowed,
 )
 from vllm.v1.worker.gpu.spec_decode.uno.state_tables import (
     build_draft_state_table,
+    draft_seed_positions,
+    pad_slots_past_limit,
     stage_conv_windows,
+    write_mrope_positions,
 )
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def unsupported_reason(vllm_config: VllmConfig) -> str | None:
+    """Why this configuration cannot run `uno`, or None if it can."""
+    if vllm_config.cache_config.mamba_cache_mode != "none":
+        return (
+            "uno requires prefix caching to be disabled "
+            "(enable_prefix_caching=False): its draft forward addresses a "
+            "request's GDN state blocks by column, which only the 'none' mamba "
+            "cache mode provides."
+        )
+    parallel = vllm_config.parallel_config
+    for name in (
+        "tensor_parallel_size",
+        "data_parallel_size",
+        "pipeline_parallel_size",
+        "prefill_context_parallel_size",
+    ):
+        if getattr(parallel, name) != 1:
+            return f"uno supports {name}=1 only."
+    if vllm_config.lora_config is not None:
+        return (
+            "uno cannot run on a LoRA-enabled engine: its draft forward would "
+            "go through the engine's LoRA layers with the target's token mapping."
+        )
+    return None
 
 
 class UnoSpeculator(DraftModelSpeculator):
@@ -63,15 +95,9 @@ class UnoSpeculator(DraftModelSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
-        if vllm_config.cache_config.mamba_cache_mode != "none":
-            raise ValueError(
-                "uno requires prefix caching to be disabled "
-                "(enable_prefix_caching=False): its draft forward addresses a "
-                "request's GDN state blocks by column, which only the 'none' "
-                "mamba cache mode provides."
-            )
-        if vllm_config.parallel_config.tensor_parallel_size != 1:
-            raise ValueError("uno supports tensor_parallel_size=1 only.")
+        reason = unsupported_reason(vllm_config)
+        if reason is not None:
+            raise ValueError(reason)
 
         # K: one seed row plus K - 1 noise rows in, K proposals out.
         self.block = self.num_speculative_steps
@@ -115,9 +141,8 @@ class UnoSpeculator(DraftModelSpeculator):
         )
         self.row_mask[0 :: self.block] = 0
         self.noise_generator = torch.Generator(device=device).manual_seed(718300)
-        self.positions_3d = torch.zeros(
-            3, self.max_num_tokens, dtype=torch.int64, device=device
-        )
+        self.rope_state = None
+        self.positions_nd: torch.Tensor | None = None
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.state_tables: dict[int, torch.Tensor] = {}
@@ -180,7 +205,16 @@ class UnoSpeculator(DraftModelSpeculator):
         self.target_input_buffers = target_input_buffers
         self.target_attn_groups = target_attn_groups
         self.attn_groups = target_attn_groups
-        self.uses_mrope = getattr(model_state, "rope_state", None) is not None
+        # M-RoPE targets take one position per axis; the runner keeps each
+        # request's offset from its token index in the rope state.
+        self.rope_state = getattr(model_state, "rope_state", None)
+        if self.rope_state is not None:
+            self.positions_nd = torch.zeros(
+                self.rope_state.num_dims,
+                self.max_num_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            )
 
         groups = kv_cache_config.kv_cache_groups
         self.mamba_gids = [
@@ -285,21 +319,18 @@ class UnoSpeculator(DraftModelSpeculator):
                 caches.append(kv)
         return caches
 
-    def _snapshot_committed(self, num_reqs: int) -> list[tuple]:
+    def _snapshot_committed(self, num_reqs: int, seed_pos: torch.Tensor) -> list[tuple]:
         """Copy every state block and K/V slot the draft forward must not change.
 
         Allowed to change: each request's scratch state block, the K/V slots at
-        its draft positions, and the null block.
+        its draft positions below the context limit, and the null block.
         """
-        block = self.block
-        first_pos = self.input_buffers.positions[: num_reqs * block].view(num_reqs, block)[:, 0]
         snaps: list[tuple] = []
         for gid in self.mamba_gids:
             real = self.block_tables.input_block_tables[gid][:num_reqs, : self.state_width]
             real = real.to(torch.int64)
             blocks = real.reshape(-1)
-            scratch = self.stage[gid][1][:num_reqs]
-            allowed = (real == scratch[:, None]).reshape(-1) | (blocks == 0)
+            allowed = state_allowed(real, self.stage[gid][1][:num_reqs])
             for module in self.gdn_modules:
                 if self.gid_of_layer[module.prefix] != gid:
                     continue
@@ -308,23 +339,13 @@ class UnoSpeculator(DraftModelSpeculator):
                     snaps.append((f"{module.prefix} {which} state", state, blocks, allowed, before))
         for gid in self.attn_gids:
             block_size = int(self.block_tables.kernel_block_sizes[gid])
-            table = self.block_tables.input_block_tables[gid][:num_reqs].to(torch.int64)
-            last_col = (first_pos + block - 1) // block_size
-            num_cols = min(int(last_col.max().item()) + 1, table.shape[1])
-            cols = torch.arange(num_cols, device=self.device)
-            # Columns past a request's last draft position can hold stale ids.
-            owned = cols[None, :] <= last_col[:, None]
-            blocks = torch.where(owned, table[:, :num_cols], 0).reshape(-1)
-            positions = first_pos[:, None] + torch.arange(block, device=self.device)[None, :]
-            rows = torch.arange(num_reqs, device=self.device)[:, None].expand_as(positions)
-            in_range = positions // block_size < num_cols
-            allowed = torch.zeros(
-                num_reqs, num_cols, block_size, dtype=torch.bool, device=self.device
+            blocks, allowed = kv_blocks_and_allowed(
+                self.block_tables.input_block_tables[gid][:num_reqs],
+                seed_pos,
+                self.block,
+                block_size,
+                self.max_model_len,
             )
-            allowed[
-                rows[in_range], (positions // block_size)[in_range], (positions % block_size)[in_range]
-            ] = True
-            allowed = allowed.reshape(-1, block_size) | (blocks == 0)[:, None]
             for kv in self._attention_caches(gid):
                 view = kv_block_view(kv, self.kv_cache_config.num_blocks, block_size)
                 before = view.index_select(0, blocks).clone()
@@ -426,8 +447,8 @@ class UnoSpeculator(DraftModelSpeculator):
         self._stage_conv_windows(num_reqs)
         input_ids = self.input_buffers.input_ids[:num_tokens_padded]
         positions = (
-            self.positions_3d[:, :num_tokens_padded]
-            if self.uses_mrope
+            self.positions_nd[:, :num_tokens_padded]
+            if self.positions_nd is not None
             else self.input_buffers.positions[:num_tokens_padded]
         )
         with (
@@ -539,6 +560,19 @@ class UnoSpeculator(DraftModelSpeculator):
                 max_model_len=self.max_model_len,
                 sample_from_anchor=True,
             )
+        # Rows at or past the context limit must not write K/V: the kernel
+        # would wrap them onto committed slots of the request's last block.
+        seed_pos = draft_seed_positions(
+            input_batch.positions, input_batch.query_start_loc, num_rejected[:num_reqs]
+        )
+        for gid in self.attn_gids:
+            pad_slots_past_limit(
+                self.block_tables.slot_mappings[gid],
+                seed_pos,
+                block,
+                self.max_model_len,
+                PAD_SLOT_ID,
+            )
         # The placeholders become uniform noise ids, as in training.
         noise = torch.randint(
             0, self.vocab_size, (num_reqs, block - 1),
@@ -562,10 +596,13 @@ class UnoSpeculator(DraftModelSpeculator):
             dp_sync=None,
         )
         num_tokens_padded = batch_desc.num_tokens
-        if self.uses_mrope:
-            self.positions_3d[:, :num_tokens_padded] = self.input_buffers.positions[
-                :num_tokens_padded
-            ]
+        if self.positions_nd is not None:
+            write_mrope_positions(
+                self.positions_nd[:, :num_tokens_padded],
+                self.input_buffers.positions[:num_tokens_padded],
+                self.rope_state.prefill_delta.gpu[input_batch.idx_mapping.to(torch.int64)],
+                block,
+            )
         draft_attn_metadata = self._build_draft_attn_metadata(
             num_reqs, batch_desc, input_batch.seq_lens_cpu_upper_bound
         )
@@ -573,7 +610,9 @@ class UnoSpeculator(DraftModelSpeculator):
             self.block_tables.slot_mappings[:, :num_tokens_padded], self.kv_cache_config
         )
 
-        snaps = self._snapshot_committed(num_reqs) if self.debug_mode == "check" else None
+        snaps = (
+            self._snapshot_committed(num_reqs, seed_pos) if self.debug_mode == "check" else None
+        )
         t1 = self._tick()
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:

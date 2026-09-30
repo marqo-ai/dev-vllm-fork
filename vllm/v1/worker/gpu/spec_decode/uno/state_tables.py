@@ -87,3 +87,59 @@ def stage_conv_windows(
             conv[dst_block[:, None], :, dst_tokens] = conv[src_block[:, None], :, src_tokens]
         else:
             conv[dst_block[:, None], dst_tokens] = conv[src_block[:, None], src_tokens]
+
+
+def draft_seed_positions(
+    target_positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_rejected: torch.Tensor,
+) -> torch.Tensor:
+    """Position of each request's seed row: one past its last accepted target row.
+
+    Not clamped to the context limit, unlike the positions the input kernel
+    writes for the draft block.
+    """
+    num_reqs = num_rejected.shape[0]
+    last_valid = (
+        query_start_loc[1 : num_reqs + 1].to(torch.int64)
+        - num_rejected.to(torch.int64)
+        - 1
+    )
+    return target_positions[last_valid].to(torch.int64) + 1
+
+
+def pad_slots_past_limit(
+    slots: torch.Tensor,
+    seed_pos: torch.Tensor,
+    block: int,
+    max_model_len: int,
+    pad_slot_id: int,
+) -> None:
+    """Stop draft rows at or past the context limit from writing K/V.
+
+    The input kernel clamps such a row's block column to the last one but
+    keeps its in-block offset, so when the block table has no spare column the
+    row would land on an early slot of the request's own last block, which
+    holds committed K/V.
+    """
+    num_reqs = seed_pos.shape[0]
+    steps = torch.arange(block, device=seed_pos.device)
+    positions = seed_pos[:, None] + steps[None, :]
+    slots[: num_reqs * block].view(num_reqs, block)[positions >= max_model_len] = pad_slot_id
+
+
+def write_mrope_positions(
+    out: torch.Tensor,
+    positions: torch.Tensor,
+    delta: torch.Tensor,
+    block: int,
+) -> None:
+    """Fill `[num_dims, T]` M-RoPE positions for the draft block.
+
+    After its prompt, a request's position on every axis is its token index
+    plus a per-request offset, which is non-zero once the prompt held an image
+    or a video. `positions` holds `block` rows per request, padding after.
+    """
+    num_tokens = positions.shape[0]
+    out[:, :num_tokens] = positions
+    out[:, : delta.shape[0] * block] += delta.to(out.dtype).repeat_interleave(block)

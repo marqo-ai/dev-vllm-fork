@@ -177,3 +177,22 @@ def test_model_dtype_path_matches_the_fp32_path():
     assert torch.allclose(got, want, atol=1e-2)
     assert not torch.allclose(got[1:], base[1:], atol=1e-2)   # and the delta is really there
     assert fused.fired == 2
+
+
+def test_bfloat16_delta_lands_on_the_leading_columns_of_a_wider_module():
+    torch.manual_seed(0)
+    layers, state = _layers(), _state()
+    for module in layers.modules():
+        if isinstance(module, _Linear):
+            module.weight.data = module.weight.data.to(torch.bfloat16)
+    x = torch.randn(4, HIDDEN).to(torch.bfloat16)
+    mask = _mask(4).to(torch.bfloat16)
+    lora = GatedLoRA(layers, state, SCALE, mask, torch.device("cpu"), dtype=torch.bfloat16)
+    base, _ = layers[0].linear_attn.in_proj_qkvz(x)
+    with lora.active():
+        out, _ = layers[0].linear_attn.in_proj_qkvz(x)
+    assert torch.equal(out[0], base[0])                       # seed row untouched
+    assert torch.equal(out[:, QKV:], base[:, QKV:])           # z columns untouched
+    want = base[1:, :QKV].float() + _delta(state, "model.layers.0.linear_attn.in_proj_qkv", x[1:].float())
+    error = (out[1:, :QKV].float() - want).abs().max() / want.abs().max()
+    assert error < 0.02
