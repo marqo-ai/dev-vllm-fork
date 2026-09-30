@@ -1424,10 +1424,11 @@ class VllmConfig:
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
                     and self.speculative_config.method != "draft_model"
                     and self.speculative_config.method != "dspark"
+                    and self.speculative_config.method != "uno"
                 ):
                     raise ValueError(
                         "Currently, async scheduling is only supported "
-                        "with EAGLE/MTP/Draft Model/NGram GPU/DSpark kind of "
+                        "with EAGLE/MTP/Draft Model/NGram GPU/DSpark/Uno kind of "
                         "speculative decoding"
                     )
                 if self.speculative_config.disable_padded_drafter_batch:
@@ -1457,6 +1458,8 @@ class VllmConfig:
                 and self.speculative_config.method not in get_args(NgramGPUTypes)
                 and self.speculative_config.method != "draft_model"
                 and self.speculative_config.method != "dspark"
+                # Uno drafts from GPU-side state only, like DFlash.
+                and self.speculative_config.method != "uno"
             ):
                 logger.warning_once(
                     "Async scheduling not supported with %s-based "

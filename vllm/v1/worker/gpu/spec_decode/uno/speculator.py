@@ -79,10 +79,10 @@ class UnoSpeculator(DraftModelSpeculator):
         self.state_width = self.block + 1
         self.adapter_path = self.speculative_config.model
         self.debug_mode = os.environ.get("VLLM_UNO_DEBUG", "")
-        self.use_graphs = os.environ.get("VLLM_UNO_GRAPHS", "0") == "1"
-        # "float32": the LoRA delta in fp32, as in training. "model": in the
-        # model's dtype, half the kernels.
-        self.lora_dtype = os.environ.get("VLLM_UNO_LORA_DTYPE", "float32")
+        self.use_graphs = os.environ.get("VLLM_UNO_GRAPHS", "1") == "1"
+        # "model": the LoRA delta in the model's dtype, three kernels per
+        # module. "float32": in fp32 as in training, about six.
+        self.lora_dtype = os.environ.get("VLLM_UNO_LORA_DTYPE", "model")
         self.profile = os.environ.get("VLLM_UNO_PROF", "0") == "1"
         self._prof = [0.0, 0.0, 0.0, 0]
 
