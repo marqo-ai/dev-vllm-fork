@@ -1,0 +1,484 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Uno (arXiv 2609.04010) linear sampler on a hybrid GDN + attention target.
+
+Per round, for a request whose committed length is L:
+
+  draft   one forward of the TARGET's own layers over [seed, noise x (K-1)] at
+          positions L-1 .. L+K-2, where the seed is the last sampled token. Row 0
+          uses the original weights and yields the exact next token; rows 1..K-1
+          carry the Uno LoRA and yield the draft.
+  verify  vLLM's unmodified verify step over [seed, draft x K].
+
+The draft leaves no trace. Attention K/V for its positions land in the request's
+own pages and are rewritten by the verify before being read. GDN state is
+handled by `state_tables.build_draft_state_table`.
+"""
+
+import os
+from typing import Any
+
+import torch
+import torch.nn as nn
+
+from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.worker.gpu.attn_utils import (
+    build_attn_metadata,
+    build_slot_mappings_by_layer,
+)
+from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridAttnMetadata
+from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import prepare_dflash_inputs
+from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.uno.gated_lora import GatedLoRA, load_uno_adapter
+from vllm.v1.worker.gpu.spec_decode.uno.state_tables import build_draft_state_table
+from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
+
+
+class UnoSpeculator(DraftModelSpeculator):
+    _speculator_name = "Uno"
+
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        super().__init__(vllm_config, device)
+        if vllm_config.cache_config.mamba_cache_mode != "none":
+            raise ValueError(
+                "uno requires prefix caching to be disabled "
+                "(enable_prefix_caching=False): its draft forward addresses a "
+                "request's GDN state blocks by column, which only the 'none' "
+                "mamba cache mode provides."
+            )
+        if vllm_config.parallel_config.tensor_parallel_size != 1:
+            raise ValueError("uno supports tensor_parallel_size=1 only.")
+
+        # K: one seed row plus K - 1 noise rows in, K proposals out.
+        self.block = self.num_speculative_steps
+        # State blocks a request owns in each GDN group.
+        self.state_width = self.block + 1
+        self.adapter_path = self.speculative_config.model
+        self.debug_mode = os.environ.get("VLLM_UNO_DEBUG", "")
+        self.use_graphs = os.environ.get("VLLM_UNO_GRAPHS", "0") == "1"
+
+        max_sampled = self.max_num_reqs * self.block
+        self.sample_indices = torch.zeros(max_sampled, dtype=torch.int64, device=device)
+        self.sample_pos = torch.zeros(max_sampled, dtype=torch.int64, device=device)
+        # -1 marks an inert sampling row (see DFlashSpeculator).
+        self.sample_idx_mapping = torch.full(
+            (max_sampled,), -1, dtype=torch.int32, device=device
+        )
+        self.sample_col = torch.arange(
+            self.block, dtype=torch.int32, device=device
+        ).repeat(self.max_num_reqs)
+        # prepare_dflash_inputs also emits the target rows' context positions
+        # and slots for DFlash's K/V precompute. Uno reads the target's own
+        # cache, so these are write-only scratch.
+        self._context_positions = torch.zeros(
+            self.max_num_tokens, dtype=torch.int64, device=device
+        )
+        self._context_slots = torch.zeros(
+            self.max_num_tokens, dtype=torch.int64, device=device
+        )
+
+        # 1 on noise rows, 0 on seed rows. Rows are laid out K per request.
+        self.row_mask = torch.ones(
+            self.max_num_tokens, 1, dtype=torch.float32, device=device
+        )
+        self.row_mask[0 :: self.block] = 0
+        self.noise_generator = torch.Generator(device=device).manual_seed(718300)
+        self.positions_3d = torch.zeros(
+            3, self.max_num_tokens, dtype=torch.int64, device=device
+        )
+
+        self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
+        self.state_tables: dict[int, torch.Tensor] = {}
+        self.stage: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self.conv_states: dict[int, list[torch.Tensor]] | None = None
+
+    # ---- model: the draft is the target ----
+    def load_draft_model(
+        self, target_model: nn.Module, target_attn_layer_names: set[str]
+    ) -> nn.Module:
+        return target_model
+
+    def load_model(self, target_model: nn.Module) -> None:
+        super().load_model(target_model)
+        # The draft block is text only.
+        self.supports_mm_inputs = False
+        causal = getattr(target_model, "language_model", target_model)
+        self.decoder = causal.model
+        layers = self.decoder.layers
+        if not all(hasattr(layer, "layer_type") for layer in layers):
+            raise ValueError(
+                "uno supports the Qwen3.5-family hybrid decoder only; got "
+                f"{type(target_model).__name__}."
+            )
+        state, scale = load_uno_adapter(self.adapter_path)
+        self.lora = GatedLoRA(layers, state, scale, self.row_mask, self.device)
+        self.gdn_modules = [
+            layer.linear_attn for layer in layers if layer.layer_type == "linear_attention"
+        ]
+        self.conv_history = self.gdn_modules[0].conv_kernel_size - 1
+        self.history_steps = torch.arange(self.conv_history, device=self.device)
+        logger.info(
+            "%s: draft = target (%d layers, %d GDN), block %d, %d adapted modules, "
+            "scale %.1f, adapter %s",
+            self._speculator_name, len(layers), len(self.gdn_modules), self.block,
+            self.lora.num_modules, scale, self.adapter_path,
+        )
+
+    def set_attn(
+        self,
+        model_state: ModelState,
+        kv_cache_config: KVCacheConfig,
+        block_tables: BlockTables,
+        target_input_buffers: InputBuffers,
+        target_attn_groups: list[list[AttentionGroup]],
+    ) -> None:
+        # No super().set_attn(): the draft adds no layers, so there are no
+        # draft attention groups to build. It runs the target's layers through
+        # the target's own metadata builders.
+        self.model_state = model_state
+        self.kv_cache_config = kv_cache_config
+        self.block_tables = block_tables
+        self.target_input_buffers = target_input_buffers
+        self.target_attn_groups = target_attn_groups
+        self.attn_groups = target_attn_groups
+        self.uses_mrope = getattr(model_state, "rope_state", None) is not None
+
+        groups = kv_cache_config.kv_cache_groups
+        self.mamba_gids = [
+            gid for gid, group in enumerate(groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        self.attn_gids = [gid for gid in range(len(groups)) if gid not in self.mamba_gids]
+        self.gid_of_layer = {
+            name: gid for gid, group in enumerate(groups) for name in group.layer_names
+        }
+        for gid in self.mamba_gids:
+            self.state_tables[gid] = torch.zeros(
+                self.max_num_reqs, self.state_width, dtype=torch.int32, device=self.device
+            )
+            self.stage[gid] = tuple(
+                torch.zeros(self.max_num_reqs, dtype=torch.int64, device=self.device)
+                for _ in range(3)
+            )
+
+    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        mode = (
+            CUDAGraphMode.FULL_DECODE_ONLY
+            if wants_full and self.use_graphs
+            else CUDAGraphMode.NONE
+        )
+        self.query_cudagraph_manager = DFlashCudaGraphManager(
+            self.vllm_config, self.device, mode, decode_query_len=self.block
+        )
+        logger.info("%s: draft CUDA graph mode %s", self._speculator_name, mode)
+
+    def capture(self) -> None:
+        assert self.query_cudagraph_manager is not None
+        if self.query_cudagraph_manager.cudagraph_mode == CUDAGraphMode.NONE:
+            return
+        # Capture against null blocks: padded rows must not touch live state.
+        self.sample_indices.zero_()
+        self.sample_pos.zero_()
+        self.sample_idx_mapping.fill_(-1)
+        for gid in self.mamba_gids:
+            self.state_tables[gid].zero_()
+            for buffer in self.stage[gid]:
+                buffer.zero_()
+        self.query_cudagraph_manager.capture(
+            self._generate_draft,
+            self.input_buffers,
+            self.block_tables,
+            self.attn_groups,
+            self.kv_cache_config,
+            self.max_model_len,
+            causal=True,
+            progress_bar_desc="Capturing uno CUDA graphs",
+        )
+
+    # ---- GDN state ----
+    def _bind_conv_states(self) -> dict[int, list[torch.Tensor]]:
+        """Collect each GDN layer's convolution-state tensor, by KV group.
+
+        KV caches are bound to layers after set_attn, so this runs lazily.
+        """
+        if self.conv_states is None:
+            bound: dict[int, list[torch.Tensor]] = {gid: [] for gid in self.mamba_gids}
+            for module in self.gdn_modules:
+                bound[self.gid_of_layer[module.prefix]].append(module.kv_cache[0])
+            self.conv_states = bound
+        return self.conv_states
+
+    def _stage_conv_windows(self, num_reqs: int) -> None:
+        """Copy each request's committed convolution history into its scratch
+        block, at the offset the kernel reads when num_accepted == state_width."""
+        dst_tokens = (self.state_width - 1) + self.history_steps
+        dim_first = is_conv_state_dim_first()
+        for gid, conv_states in self._bind_conv_states().items():
+            src_block, dst_block, src_offset = (b[:num_reqs] for b in self.stage[gid])
+            src_tokens = src_offset[:, None] + self.history_steps[None, :]
+            for conv in conv_states:
+                if dim_first:  # [blocks, dim, state_len]
+                    window = conv[src_block[:, None], :, src_tokens]
+                    conv[dst_block[:, None], :, dst_tokens[None, :]] = window
+                else:  # [blocks, state_len, dim]
+                    window = conv[src_block[:, None], src_tokens]
+                    conv[dst_block[:, None], dst_tokens[None, :]] = window
+
+    def _prepare_state_tables(
+        self, input_batch: InputBatch, active: torch.Tensor
+    ) -> None:
+        num_reqs = input_batch.num_reqs
+        accepted = self.model_state.num_accepted_tokens_gpu[input_batch.idx_mapping]
+        for gid in self.mamba_gids:
+            real = self.block_tables.input_block_tables[gid][:num_reqs]
+            table, src_block, dst_block, src_offset = build_draft_state_table(
+                real, accepted, active, self.state_width
+            )
+            self.state_tables[gid].zero_()
+            self.state_tables[gid][:num_reqs] = table
+            for buffer, value in zip(self.stage[gid], (src_block, dst_block, src_offset)):
+                buffer.zero_()
+                buffer[:num_reqs] = value
+
+    # ---- attention metadata ----
+    def _build_draft_attn_metadata(
+        self,
+        num_reqs: int,
+        batch_desc: BatchExecutionDescriptor,
+        seq_lens_cpu_upper_bound: torch.Tensor,
+    ) -> dict[str, Any]:
+        block = self.block
+        num_reqs_padded = batch_desc.num_reqs or num_reqs
+        num_tokens = (
+            batch_desc.num_tokens
+            if batch_desc.cg_mode == CUDAGraphMode.FULL
+            else num_reqs * block
+        )
+        query_start_loc_cpu = torch.empty(num_reqs_padded + 1, dtype=torch.int32)
+        query_start_loc_cpu[: num_reqs + 1] = (
+            torch.arange(num_reqs + 1, dtype=torch.int32) * block
+        )
+        query_start_loc_cpu[num_reqs:] = num_reqs * block
+        seq_lens_upper = torch.zeros(num_reqs_padded, dtype=torch.int32)
+        torch.add(
+            seq_lens_cpu_upper_bound[:num_reqs], block, out=seq_lens_upper[:num_reqs]
+        )
+        seq_lens_upper[:num_reqs].clamp_(max=self.max_model_len)
+
+        # GDN groups get the draft tables; attention groups keep the real ones.
+        block_tables = [
+            (self.state_tables[gid] if gid in self.state_tables else table)[:num_reqs_padded]
+            for gid, table in enumerate(self.block_tables.input_block_tables)
+        ]
+        # Mark every real row as a speculative decode of `block` rows that
+        # starts from the last state column. Padded rows stay non-speculative
+        # and zero-length, which the GDN builder ignores.
+        num_draft_tokens_cpu = torch.full((num_reqs_padded,), -1, dtype=torch.int32)
+        num_draft_tokens_cpu[:num_reqs] = block - 1
+        hybrid_metadata = MambaHybridAttnMetadata(
+            is_prefilling=torch.zeros(num_reqs_padded, dtype=torch.bool),
+            num_accepted_tokens=torch.full(
+                (num_reqs_padded,), self.state_width, dtype=torch.int32, device=self.device
+            ),
+            num_decode_draft_tokens_cpu=num_draft_tokens_cpu,
+        )
+        return build_attn_metadata(
+            attn_groups=self.attn_groups,
+            num_reqs=num_reqs_padded,
+            num_tokens=num_tokens,
+            query_start_loc_gpu=self.input_buffers.query_start_loc[: num_reqs_padded + 1],
+            query_start_loc_cpu=query_start_loc_cpu,
+            max_query_len=block,
+            seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
+            max_seq_len=self.max_model_len,
+            block_tables=block_tables,
+            slot_mappings=self.block_tables.slot_mappings[:, :num_tokens],
+            kv_cache_config=self.kv_cache_config,
+            seq_lens_cpu_upper_bound=seq_lens_upper,
+            model_specific_attn_metadata=hybrid_metadata,
+            causal=True,
+        )
+
+    # ---- the draft forward (this is what the CUDA graph captures) ----
+    @torch.inference_mode()
+    def _generate_draft(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> None:
+        self._stage_conv_windows(num_reqs)
+        input_ids = self.input_buffers.input_ids[:num_tokens_padded]
+        positions = (
+            self.positions_3d[:, :num_tokens_padded]
+            if self.uses_mrope
+            else self.input_buffers.positions[:num_tokens_padded]
+        )
+        with (
+            set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                num_tokens_across_dp=num_tokens_across_dp,
+                slot_mapping=slot_mappings,
+                batch_descriptor=BatchDescriptor(num_tokens=num_tokens_padded),
+            ),
+            self.lora.active(),
+        ):
+            # The decoder's own layer loop, run directly: its compiled forward
+            # is traced for the runner's argument pattern.
+            hidden_states = self.decoder.embed_input_ids(input_ids)
+            residual = None
+            for layer in self.decoder.layers:
+                hidden_states, residual = layer(
+                    positions=positions, hidden_states=hidden_states, residual=residual
+                )
+            hidden_states, _ = self.decoder.norm(hidden_states, residual)
+        self.lora.check_all_fired()
+
+        num_sample = num_reqs * self.block
+        draft_tokens = self.sample_draft(
+            hidden_states[self.sample_indices[:num_sample]],
+            # sample_pos is the predicted token's position; a draw is keyed by
+            # the position before it.
+            self.sample_pos[:num_sample] - 1,
+            self.sample_idx_mapping[:num_sample],
+            self.temperature,
+            self.seeds,
+            self.sample_col[:num_sample],
+            self.draft_logits,
+        )
+        self.draft_tokens[:num_reqs] = draft_tokens.view(num_reqs, self.block)
+
+    # ---- the round ----
+    @torch.inference_mode()
+    def propose(
+        self,
+        input_batch: InputBatch,
+        attn_metadata: dict[str, Any],
+        slot_mappings: dict[str, torch.Tensor],
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        dp_sync: DPSyncState | None = None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        is_profile: bool = False,
+    ) -> torch.Tensor:
+        num_reqs = input_batch.num_reqs
+        block = self.block
+        if dummy_run or is_profile or self.debug_mode == "null":
+            self.draft_tokens[:num_reqs].zero_()
+            return self.draft_tokens[:num_reqs]
+
+        # Inputs for [seed, placeholder x (K-1)] per request: ids, positions,
+        # sequence lengths, K/V slots in the request's own pages, and the
+        # sampling indices. Every row predicts the next token
+        # (sample_from_anchor), which is Uno's layout.
+        for gid in self.attn_gids:
+            prepare_dflash_inputs(
+                input_buffers=self.input_buffers,
+                query_slot_mapping=self.block_tables.slot_mappings[gid],
+                context_positions=self._context_positions,
+                context_slot_mapping=self._context_slots,
+                sample_indices=self.sample_indices,
+                sample_pos=self.sample_pos,
+                sample_idx_mapping=self.sample_idx_mapping,
+                temperature=self.temperature,
+                seeds=self.seeds,
+                input_batch=input_batch,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                last_sampled=last_sampled,
+                next_prefill_tokens=next_prefill_tokens,
+                input_temperature=temperature,
+                input_seeds=seeds,
+                block_table=self.block_tables.input_block_tables[gid],
+                block_size=self.block_tables.kernel_block_sizes[gid],
+                cp_rank=self.block_tables.cp_rank,
+                cp_size=self.block_tables.cp_size,
+                cp_interleave=self.block_tables.cp_interleave,
+                parallel_drafting_token_id=0,
+                num_query_per_req=block,
+                num_speculative_steps=block,
+                max_num_reqs=self.max_num_reqs,
+                max_num_tokens=self.max_num_tokens,
+                max_model_len=self.max_model_len,
+                sample_from_anchor=True,
+            )
+        # The placeholders become uniform noise ids, as in training.
+        noise = torch.randint(
+            0, self.vocab_size, (num_reqs, block - 1),
+            generator=self.noise_generator, device=self.device, dtype=torch.int32,
+        )
+        self.input_buffers.input_ids[: num_reqs * block].view(num_reqs, block)[:, 1:] = noise
+
+        # A request that sampled nothing this step is still prefilling: its
+        # rows run, but against null state blocks.
+        active = num_sampled[:num_reqs] > 0
+        self._prepare_state_tables(input_batch, active)
+
+        batch_desc, batch_sync = dispatch_cg_and_sync_dp(
+            self.query_cudagraph_manager,
+            num_reqs,
+            num_reqs * block,
+            uniform_token_count=block,
+            dp_size=self.dp_size,
+            dp_rank=self.dp_rank,
+            need_eager=is_profile,
+            dp_sync=None,
+        )
+        num_tokens_padded = batch_desc.num_tokens
+        if self.uses_mrope:
+            self.positions_3d[:, :num_tokens_padded] = self.input_buffers.positions[
+                :num_tokens_padded
+            ]
+        draft_attn_metadata = self._build_draft_attn_metadata(
+            num_reqs, batch_desc, input_batch.seq_lens_cpu_upper_bound
+        )
+        draft_slot_mappings = build_slot_mappings_by_layer(
+            self.block_tables.slot_mappings[:, :num_tokens_padded], self.kv_cache_config
+        )
+
+        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            assert self.query_cudagraph_manager is not None
+            self.query_cudagraph_manager.run_fullgraph(batch_desc)
+        else:
+            self._generate_draft(
+                num_reqs,
+                num_tokens_padded,
+                draft_attn_metadata,
+                draft_slot_mappings,
+                num_tokens_across_dp=(
+                    batch_sync.num_tokens_across_dp if batch_sync is not None else None
+                ),
+                cudagraph_runtime_mode=batch_desc.cg_mode,
+            )
+
+        if self.debug_mode == "discard":
+            self.draft_tokens[:num_reqs].zero_()
+        return self.draft_tokens[:num_reqs]

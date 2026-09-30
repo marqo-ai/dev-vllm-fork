@@ -66,6 +66,7 @@ MTPModelTypes = Literal[
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
+UnoModelTypes = Literal["uno"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -79,6 +80,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
     DSparkModelTypes,
+    UnoModelTypes,
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
@@ -1219,6 +1221,21 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config
+        elif self.method == "uno":
+            # Uno drafts with the target model itself plus a row-gated LoRA, so
+            # there is no draft checkpoint: `model` is the adapter file, and the
+            # target's config doubles as the draft config.
+            if self.model is None or self.num_speculative_tokens is None:
+                raise ValueError(
+                    "method='uno' requires `model` (the Uno adapter file) and "
+                    "`num_speculative_tokens` (the draft block size)."
+                )
+            if self.num_speculative_tokens < 2:
+                raise ValueError("method='uno' requires num_speculative_tokens >= 2.")
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
         elif self.method == "extract_hidden_states":
             from vllm.transformers_utils.configs.extract_hidden_states import (
                 ExtractHiddenStatesConfig,
@@ -1870,6 +1887,11 @@ class SpeculativeConfig:
         ==================== ============= ======== ================
         """
         num_draft_tokens = self.num_speculative_tokens
+
+        if self.method == "uno":
+            # The draft block is the seed row plus K - 1 noise rows; the seed
+            # reuses the request's existing query slot.
+            return num_draft_tokens - 1
 
         if self.use_dflash():
             # DFlash uses one bonus query followed by K mask queries.

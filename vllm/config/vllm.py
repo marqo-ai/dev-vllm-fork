@@ -637,6 +637,10 @@ class VllmConfig:
         speculative_config = self.speculative_config
         if speculative_config is None:
             return 0
+        if speculative_config.method == "uno":
+            # The draft block writes K/V for the seed and K - 1 noise positions
+            # into the request's own pages, past the target's query range.
+            return self.num_speculative_tokens
         if speculative_config.use_dflash():
             # DFlash requires an extra lookahead slot since it uses in-fill-style
             # decoding instead of standard next-token sampling, so it has a query
@@ -2891,6 +2895,8 @@ class VllmConfig:
         if self.speculative_config:
             if self.speculative_config.method == "dspark":
                 unsupported.append("dspark speculative decoding")
+            if self.speculative_config.method == "uno":
+                unsupported.append("uno speculative decoding")
             if self.speculative_config.enable_adaptive_verification:
                 unsupported.append("adaptive draft verification")
 
