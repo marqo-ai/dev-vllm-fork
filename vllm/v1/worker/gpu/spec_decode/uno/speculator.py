@@ -16,6 +16,8 @@ handled by `state_tables.build_draft_state_table`.
 """
 
 import os
+import time
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -78,6 +80,11 @@ class UnoSpeculator(DraftModelSpeculator):
         self.adapter_path = self.speculative_config.model
         self.debug_mode = os.environ.get("VLLM_UNO_DEBUG", "")
         self.use_graphs = os.environ.get("VLLM_UNO_GRAPHS", "0") == "1"
+        # "float32": the LoRA delta in fp32, as in training. "model": in the
+        # model's dtype, half the kernels.
+        self.lora_dtype = os.environ.get("VLLM_UNO_LORA_DTYPE", "float32")
+        self.profile = os.environ.get("VLLM_UNO_PROF", "0") == "1"
+        self._prof = [0.0, 0.0, 0.0, 0]
 
         max_sampled = self.max_num_reqs * self.block
         self.sample_indices = torch.zeros(max_sampled, dtype=torch.int64, device=device)
@@ -101,7 +108,10 @@ class UnoSpeculator(DraftModelSpeculator):
 
         # 1 on noise rows, 0 on seed rows. Rows are laid out K per request.
         self.row_mask = torch.ones(
-            self.max_num_tokens, 1, dtype=torch.float32, device=device
+            self.max_num_tokens,
+            1,
+            dtype=torch.float32 if self.lora_dtype == "float32" else self.dtype,
+            device=device,
         )
         self.row_mask[0 :: self.block] = 0
         self.noise_generator = torch.Generator(device=device).manual_seed(718300)
@@ -134,7 +144,14 @@ class UnoSpeculator(DraftModelSpeculator):
                 f"{type(target_model).__name__}."
             )
         state, scale = load_uno_adapter(self.adapter_path)
-        self.lora = GatedLoRA(layers, state, scale, self.row_mask, self.device)
+        self.lora = GatedLoRA(
+            layers,
+            state,
+            scale,
+            self.row_mask,
+            self.device,
+            None if self.lora_dtype == "float32" else self.dtype,
+        )
         self.gdn_modules = [
             layer.linear_attn for layer in layers if layer.layer_type == "linear_attention"
         ]
@@ -423,7 +440,9 @@ class UnoSpeculator(DraftModelSpeculator):
                 slot_mapping=slot_mappings,
                 batch_descriptor=BatchDescriptor(num_tokens=num_tokens_padded),
             ),
-            self.lora.active(),
+            # VLLM_UNO_DEBUG=nolora drafts with the original weights on every
+            # row, to measure what the LoRA costs.
+            nullcontext() if self.debug_mode == "nolora" else self.lora.active(),
         ):
             # The decoder's own layer loop, run directly: its compiled forward
             # is traced for the runner's argument pattern.
@@ -434,7 +453,8 @@ class UnoSpeculator(DraftModelSpeculator):
                     positions=positions, hidden_states=hidden_states, residual=residual
                 )
             hidden_states, _ = self.decoder.norm(hidden_states, residual)
-        self.lora.check_all_fired()
+        if self.debug_mode != "nolora":
+            self.lora.check_all_fired()
 
         num_sample = num_reqs * self.block
         draft_tokens = self.sample_draft(
@@ -449,6 +469,12 @@ class UnoSpeculator(DraftModelSpeculator):
             self.draft_logits,
         )
         self.draft_tokens[:num_reqs] = draft_tokens.view(num_reqs, self.block)
+
+    def _tick(self) -> float:
+        if not self.profile:
+            return 0.0
+        torch.cuda.synchronize()
+        return time.perf_counter()
 
     # ---- the round ----
     @torch.inference_mode()
@@ -476,6 +502,7 @@ class UnoSpeculator(DraftModelSpeculator):
         if dummy_run or is_profile or self.debug_mode == "null":
             self.draft_tokens[:num_reqs].zero_()
             return self.draft_tokens[:num_reqs]
+        t0 = self._tick()
 
         # Inputs for [seed, placeholder x (K-1)] per request: ids, positions,
         # sequence lengths, K/V slots in the request's own pages, and the
@@ -547,6 +574,7 @@ class UnoSpeculator(DraftModelSpeculator):
         )
 
         snaps = self._snapshot_committed(num_reqs) if self.debug_mode == "check" else None
+        t1 = self._tick()
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
@@ -563,6 +591,22 @@ class UnoSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
 
+        if self.profile:
+            t2 = self._tick()
+            self._prof[0] += t1 - t0
+            self._prof[1] += t2 - t1
+            self._prof[3] += 1
+            if self._prof[3] % 200 == 0:
+                logger.info(
+                    "%s: per round, prepare %.2f ms, draft forward %.2f ms (%d rounds, "
+                    "LoRA %s, debug %r)",
+                    self._speculator_name,
+                    1e3 * self._prof[0] / self._prof[3],
+                    1e3 * self._prof[1] / self._prof[3],
+                    self._prof[3],
+                    self.lora_dtype,
+                    self.debug_mode,
+                )
         if snaps is not None:
             self._assert_untouched(
                 snaps, self.model_state.num_accepted_tokens_gpu[input_batch.idx_mapping]

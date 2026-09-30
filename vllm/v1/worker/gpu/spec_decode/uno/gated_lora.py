@@ -11,6 +11,11 @@ Math, per adapted projection, as in training:
     y += row_mask * scale * (x.float() @ A^T) @ B^T
 Projections that vLLM packs into one module (q/k/v, gate/up, qkv/z) are
 concatenated along the rank axis so each module costs two GEMMs.
+
+Two ways to run it. With `dtype=None` the delta is computed in fp32 exactly as
+in training and cast back, about six small kernels per module. With a dtype
+(the model's), the matrices live in that dtype and the delta is three kernels:
+a GEMM, the row mask, and an in-place addmm.
 """
 
 import json
@@ -62,6 +67,7 @@ class GatedLoRA:
         scale: float,
         row_mask: torch.Tensor,
         device: torch.device,
+        dtype: torch.dtype | None = None,
     ):
         grouped: dict[tuple[int, str], dict[int, dict[str, torch.Tensor]]] = {}
         for key, tensor in state.items():
@@ -86,7 +92,14 @@ class GatedLoRA:
             a_cat = torch.cat([slices[i]["A"].float() for i in range(len(slices))], dim=0)
             b_cat = torch.block_diag(*[slices[i]["B"].float() * scale for i in range(len(slices))])
             module = layers[layer].get_submodule(path)
-            self._hooks.append((module, self._make_hook(a_cat.to(device), b_cat.to(device))))
+            if dtype is None:
+                hook = self._make_hook(a_cat.to(device), b_cat.to(device))
+            else:
+                hook = self._make_fused_hook(
+                    a_cat.to(device=device, dtype=dtype),
+                    b_cat.to(device=device, dtype=dtype).t().contiguous(),
+                )
+            self._hooks.append((module, hook))
         self.num_modules = len(self._hooks)
 
     def _make_hook(self, a: torch.Tensor, b: torch.Tensor):
@@ -95,6 +108,16 @@ class GatedLoRA:
             x = args[0]
             hidden = torch.nn.functional.linear(x.float(), a) * self.row_mask[: x.shape[0]]
             out[:, : b.shape[0]] += torch.nn.functional.linear(hidden, b).to(out.dtype)
+            self.fired += 1
+
+        return hook
+
+    def _make_fused_hook(self, a: torch.Tensor, b_t: torch.Tensor):
+        def hook(module, args, output):
+            out = output[0] if isinstance(output, tuple) else output
+            x = args[0]
+            hidden = torch.nn.functional.linear(x, a) * self.row_mask[: x.shape[0]]
+            out[:, : b_t.shape[1]].addmm_(hidden, b_t)
             self.fired += 1
 
         return hook

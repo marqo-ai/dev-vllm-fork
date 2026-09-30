@@ -160,3 +160,20 @@ def test_a_missing_sidecar_is_an_error(tmp_path):
     torch.save(_state(), path)
     with pytest.raises(FileNotFoundError):
         load_uno_adapter(str(path))
+
+
+def test_model_dtype_path_matches_the_fp32_path():
+    torch.manual_seed(0)
+    layers, state, x = _layers(), _state(), torch.randn(4, HIDDEN)
+    exact = GatedLoRA(layers, state, SCALE, _mask(4), torch.device("cpu"))
+    fused = GatedLoRA(layers, state, SCALE, _mask(4), torch.device("cpu"), dtype=torch.float32)
+    base, _ = layers[1].self_attn.qkv_proj(x)
+    with exact.active():
+        want, _ = layers[1].self_attn.qkv_proj(x)
+    with fused.active():
+        got, _ = layers[1].self_attn.qkv_proj(x)
+        layers[0].linear_attn.in_proj_qkvz(x)
+    assert torch.equal(got[0], base[0])                       # seed row untouched
+    assert torch.allclose(got, want, atol=1e-2)
+    assert not torch.allclose(got[1:], base[1:], atol=1e-2)   # and the delta is really there
+    assert fused.fired == 2
