@@ -16,11 +16,23 @@ Two ways to run it. With `dtype=None` the delta is computed in fp32 exactly as
 in training and cast back, about six small kernels per module. With a dtype
 (the model's), the matrices live in that dtype and the delta is three kernels:
 a GEMM, the row mask, and an in-place addmm.
+
+`draft_base` swaps the base projection as well, for the draft forward only: it
+maps a weight to a function computing the linear output from a cheaper copy of
+it (see draft_weights.py). Every draft row then reads the cheaper copy, the
+seed row included, so this trades acceptance for the bytes the draft forward
+has to read; the verify forward is never affected. With `fold`, A is appended
+to that weight as extra output channels, so the base GEMM also produces the
+LoRA's hidden and the delta costs one addmm. With `block` (rows per request),
+a batch of one request adds the delta to its noise rows directly instead of
+masking the seed row out. A batch of more than `max_rows` rows reads the
+module's own weight: a low-bit kernel decodes per row and loses to the dense
+GEMM once the batch is large.
 """
 
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -68,7 +80,18 @@ class GatedLoRA:
         row_mask: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype | None = None,
+        draft_base: Callable[[torch.Tensor], Callable[[torch.Tensor], torch.Tensor]]
+        | None = None,
+        fold: bool = False,
+        block: int | None = None,
+        max_rows: int | None = None,
     ):
+        if draft_base is not None and dtype is None:
+            raise ValueError(
+                "A draft-only base needs the LoRA delta in the model dtype; pass dtype."
+            )
+        if fold and draft_base is None:
+            raise ValueError("Folding A into the base weight needs a draft-only base.")
         grouped: dict[tuple[int, str], dict[int, dict[str, torch.Tensor]]] = {}
         for key, tensor in state.items():
             match = _KEY.match(key)
@@ -81,8 +104,11 @@ class GatedLoRA:
             grouped.setdefault((layer, path), {}).setdefault(slot, {})[side] = tensor
 
         self.row_mask = row_mask
+        self.block = block
+        self.max_rows = max_rows
         self.fired = 0
         self._hooks: list[tuple[nn.Module, object]] = []
+        self._forwards: list[tuple[nn.Module, object]] = []
         for (layer, path), slices in sorted(grouped.items()):
             if sorted(slices) != list(range(len(slices))):
                 raise ValueError(
@@ -93,14 +119,21 @@ class GatedLoRA:
             b_cat = torch.block_diag(*[slices[i]["B"].float() * scale for i in range(len(slices))])
             module = layers[layer].get_submodule(path)
             if dtype is None:
-                hook = self._make_hook(a_cat.to(device), b_cat.to(device))
-            else:
-                hook = self._make_fused_hook(
-                    a_cat.to(device=device, dtype=dtype),
-                    b_cat.to(device=device, dtype=dtype).t().contiguous(),
+                self._hooks.append((module, self._make_hook(a_cat.to(device), b_cat.to(device))))
+                continue
+            a = a_cat.to(device=device, dtype=dtype)
+            b_t = b_cat.to(device=device, dtype=dtype).t().contiguous()
+            if draft_base is None:
+                self._hooks.append((module, self._make_fused_hook(a, b_t)))
+                continue
+            if getattr(module, "bias", None) is not None:
+                raise ValueError(
+                    f"A draft-only base needs a bias-free projection; layer {layer} {path} has a bias."
                 )
-            self._hooks.append((module, hook))
-        self.num_modules = len(self._hooks)
+            weight = module.weight.detach()
+            base = draft_base(torch.cat([weight, a.to(weight.dtype)], dim=0) if fold else weight)
+            self._forwards.append((module, self._make_forward(module, base, fold, a, b_t)))
+        self.num_modules = len(self._hooks) + len(self._forwards)
 
     def _make_hook(self, a: torch.Tensor, b: torch.Tensor):
         def hook(module, args, output):
@@ -122,15 +155,49 @@ class GatedLoRA:
 
         return hook
 
+    def _make_forward(self, module: nn.Module, base, fold: bool, a: torch.Tensor, b_t: torch.Tensor):
+        # vLLM's linear layers return (output, bias) unless return_bias is off.
+        with_bias = getattr(module, "return_bias", True)
+        own_forward = type(module).forward
+        width = module.weight.shape[0]
+        rank, cols = b_t.shape
+
+        def forward(x):
+            rows = x.shape[0]
+            self.fired += 1
+            if self.max_rows is not None and rows > self.max_rows:
+                result = own_forward(module, x)
+                out = result[0] if with_bias else result
+                hidden = torch.nn.functional.linear(x, a) * self.row_mask[:rows]
+                out[:, :cols].addmm_(hidden, b_t)
+                return result
+            out = base(x)
+            # Folded: the columns past the module's own are x @ A^T, then
+            # whatever the base pads its output with.
+            hidden = out[:, width : width + rank] if fold else torch.nn.functional.linear(x, a)
+            out = out[:, :width]
+            if self.block is not None and rows < 2 * self.block:
+                # One request: row 0 is its seed row, the rest noise or padding.
+                out[1:, :cols].addmm_(hidden[1:], b_t)
+            else:
+                out[:, :cols].addmm_(hidden * self.row_mask[:rows], b_t)
+            return (out, None) if with_bias else out
+
+        return forward
+
     @contextmanager
     def active(self) -> Iterator[None]:
         handles = [module.register_forward_hook(hook) for module, hook in self._hooks]
+        for module, forward in self._forwards:
+            module.forward = forward
         self.fired = 0
         try:
             yield
         finally:
             for handle in handles:
                 handle.remove()
+            for module, _ in self._forwards:
+                del module.forward
 
     def check_all_fired(self) -> None:
         """Every adapted module must have run exactly once in the last forward.

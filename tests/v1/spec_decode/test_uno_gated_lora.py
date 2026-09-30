@@ -196,3 +196,143 @@ def test_bfloat16_delta_lands_on_the_leading_columns_of_a_wider_module():
     want = base[1:, :QKV].float() + _delta(state, "model.layers.0.linear_attn.in_proj_qkv", x[1:].float())
     error = (out[1:, :QKV].float() - want).abs().max() / want.abs().max()
     assert error < 0.02
+
+
+def _exact_base(weight):
+    """A draft base that is the plain linear of whatever weight it is handed."""
+    return lambda inputs: torch.nn.functional.linear(inputs, weight)
+
+
+def test_a_draft_only_base_replaces_the_module_forward_inside_the_context_only():
+    torch.manual_seed(0)
+    layers, state, x = _layers(), _state(), torch.randn(4, HIDDEN)
+    module = layers[1].mlp.gate_up_proj
+    lora = GatedLoRA(layers, state, SCALE, _mask(4), torch.device("cpu"), dtype=torch.float32,
+                     draft_base=lambda weight: (lambda inputs: 2 * torch.nn.functional.linear(inputs, weight)))
+    original, _ = module(x)
+    with lora.active():
+        drafted, bias = module(x)
+    after, _ = module(x)
+
+    assert bias is None
+    assert torch.equal(after, original)                                  # forward restored
+    assert torch.allclose(drafted[0], 2 * original[0], atol=1e-4)        # seed row: draft base, no LoRA
+    want = 2 * original[1:, :INTER] + _delta(state, "model.layers.1.mlp.gate_proj", x[1:])
+    assert torch.allclose(drafted[1:, :INTER], want, atol=1e-2)
+    assert lora.fired == 1
+
+
+def test_a_draft_only_base_needs_the_model_dtype_lora_path():
+    with pytest.raises(ValueError, match="dtype"):
+        GatedLoRA(_layers(), _state(), SCALE, _mask(4), torch.device("cpu"), draft_base=_exact_base)
+
+
+def test_folding_hands_the_base_a_weight_with_the_lora_inputs_appended():
+    torch.manual_seed(0)
+    layers, state = _layers(), _state()
+    shapes = []
+
+    def draft_base(weight):
+        shapes.append(tuple(weight.shape))
+        return _exact_base(weight)
+
+    GatedLoRA(layers, state, SCALE, _mask(4), torch.device("cpu"), dtype=torch.float32,
+              draft_base=draft_base, fold=True)
+    # GDN layer: qkvz + 1 projection, out_proj + 1, gate_up + 2, down + 1; attention layer: qkv + 3, ...
+    assert shapes == [
+        (QKV + Z + RANK, HIDDEN), (HIDDEN + RANK, HIDDEN), (HIDDEN + RANK, INTER), (2 * INTER + 2 * RANK, HIDDEN),
+        (HIDDEN + RANK, INTER), (2 * INTER + 2 * RANK, HIDDEN), (HIDDEN + RANK, HIDDEN), (Q + 2 * KV + 3 * RANK, HIDDEN),
+    ]
+
+
+@pytest.mark.parametrize("requests", [1, 2])
+def test_a_folded_base_gives_the_same_output_as_the_separate_lora(requests):
+    torch.manual_seed(0)
+    layers, state = _layers(), _state()
+    rows = 4 * requests
+    x = torch.randn(rows, HIDDEN)
+    mask = torch.ones(rows, 1)
+    mask[0::4] = 0
+    separate = GatedLoRA(layers, state, SCALE, mask, torch.device("cpu"), dtype=torch.float32)
+    folded = GatedLoRA(layers, state, SCALE, mask, torch.device("cpu"), dtype=torch.float32,
+                       draft_base=_exact_base, fold=True, block=4)
+    for module in (layers[0].linear_attn.in_proj_qkvz, layers[1].self_attn.qkv_proj, layers[1].mlp.down_proj):
+        inputs = x if module.weight.shape[1] == HIDDEN else torch.randn(rows, INTER)
+        base, _ = module(inputs)
+        with separate.active():
+            want, _ = module(inputs)
+        with folded.active():
+            got, _ = module(inputs)
+        assert got.shape == base.shape
+        assert torch.equal(got[0::4], base[0::4])                 # seed rows untouched
+        assert torch.allclose(got, want, atol=1e-2)
+        assert not torch.allclose(got[1], base[1], atol=1e-2)
+
+
+def test_a_single_request_padded_past_the_block_still_leaves_the_seed_row_alone():
+    torch.manual_seed(0)
+    layers, state, x = _layers(), _state(), torch.randn(5, HIDDEN)     # block 4 + one padding row
+    mask = torch.ones(8, 1)
+    mask[0::4] = 0
+    lora = GatedLoRA(layers, state, SCALE, mask, torch.device("cpu"), dtype=torch.float32,
+                     draft_base=_exact_base, block=4)
+    module = layers[1].self_attn.o_proj
+    base, _ = module(x)
+    with lora.active():
+        got, _ = module(x)
+    assert torch.equal(got[0], base[0])
+    want = base[1:4] + _delta(state, "model.layers.1.self_attn.o_proj", x[1:4])
+    assert torch.allclose(got[1:4], want, atol=1e-2)
+
+
+def test_a_module_with_a_bias_cannot_take_a_draft_base():
+    layers = _layers()
+    layers[0].mlp.down_proj.bias = nn.Parameter(torch.zeros(HIDDEN))
+    with pytest.raises(ValueError, match="bias"):
+        GatedLoRA(layers, _state(), SCALE, _mask(4), torch.device("cpu"), dtype=torch.float32,
+                  draft_base=_exact_base)
+
+
+@pytest.mark.parametrize("fold", [False, True])
+def test_batches_above_max_rows_read_the_modules_own_weight(fold):
+    torch.manual_seed(0)
+    layers, state = _layers(), _state()
+    mask = torch.ones(8, 1)
+    mask[0::4] = 0
+    doubled = lambda weight: (lambda inputs: 2 * torch.nn.functional.linear(inputs, weight))  # noqa: E731
+    lora = GatedLoRA(layers, state, SCALE, mask, torch.device("cpu"), dtype=torch.float32,
+                     draft_base=doubled, fold=fold, block=4, max_rows=4)
+    module = layers[1].self_attn.o_proj
+    small, large = torch.randn(4, HIDDEN), torch.randn(8, HIDDEN)
+    base_small, _ = module(small)
+    base_large, _ = module(large)
+    with lora.active():
+        got_small, _ = module(small)
+        got_large, bias = module(large)
+
+    assert bias is None
+    assert torch.allclose(got_small[0], 2 * base_small[0], atol=1e-4)      # the draft base
+    assert torch.equal(got_large[0::4], base_large[0::4])                   # the module's own weight, seed rows
+    noise = [1, 2, 3, 5, 6, 7]
+    want = base_large[noise] + _delta(state, "model.layers.1.self_attn.o_proj", large[noise])
+    assert torch.allclose(got_large[noise], want, atol=1e-2)
+    assert lora.fired == 2
+
+
+def test_a_folded_base_may_return_padding_columns_after_the_lora_ones():
+    torch.manual_seed(0)
+    layers, state, x = _layers(), _state(), torch.randn(4, HIDDEN)
+
+    def padded(weight):
+        return lambda inputs: torch.nn.functional.pad(torch.nn.functional.linear(inputs, weight), (0, 5), value=7.0)
+
+    separate = GatedLoRA(layers, state, SCALE, _mask(4), torch.device("cpu"), dtype=torch.float32)
+    folded = GatedLoRA(layers, state, SCALE, _mask(4), torch.device("cpu"), dtype=torch.float32,
+                       draft_base=padded, fold=True, block=4)
+    module = layers[1].self_attn.qkv_proj
+    with separate.active():
+        want, _ = module(x)
+    with folded.active():
+        got, _ = module(x)
+    assert got.shape == want.shape
+    assert torch.allclose(got, want, atol=1e-2)

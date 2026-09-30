@@ -44,6 +44,8 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridAttnMetadata
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import prepare_dflash_inputs
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.uno.draft_norms import DraftNorms
+from vllm.v1.worker.gpu.spec_decode.uno.draft_weights import KINDS, draft_linear
 from vllm.v1.worker.gpu.spec_decode.uno.gated_lora import GatedLoRA, load_uno_adapter
 from vllm.v1.worker.gpu.spec_decode.uno.isolation import (
     changed_blocks,
@@ -109,8 +111,33 @@ class UnoSpeculator(DraftModelSpeculator):
         # "model": the LoRA delta in the model's dtype, three kernels per
         # module. "float32": in fp32 as in training, about six.
         self.lora_dtype = os.environ.get("VLLM_UNO_LORA_DTYPE", "model")
-        self.profile = os.environ.get("VLLM_UNO_PROF", "0") == "1"
+        # "fp8" / "int4": the draft forward reads a low-bit copy of every
+        # adapted projection (draft_weights.py). Costs acceptance, never output.
+        self.draft_weights = os.environ.get("VLLM_UNO_DRAFT_WEIGHTS", "")
+        if self.draft_weights and (
+            self.draft_weights not in KINDS or self.lora_dtype == "float32"
+        ):
+            raise ValueError(
+                f"VLLM_UNO_DRAFT_WEIGHTS must be one of {KINDS} and needs "
+                "VLLM_UNO_LORA_DTYPE=model."
+            )
+        # "auto": fold A into the draft weight for fp8 only. "1" / "0" force it.
+        self.fold_lora = os.environ.get("VLLM_UNO_FOLD_LORA", "auto")
+        # The draft forward's RMSNorms as one compiled kernel pair each
+        # (draft_norms.py); "0" leaves them as the eager fp32 formula.
+        self.fused_norms = os.environ.get("VLLM_UNO_FUSED_NORMS", "1") == "1"
+        # Above this many draft rows the dense GEMM on the target's weight wins
+        # (measured on an H200: even at 64 rows, behind at 128).
+        self.draft_weights_max_rows = int(
+            os.environ.get("VLLM_UNO_DRAFT_WEIGHTS_MAX_ROWS", "64")
+        )
+        # "1": per-round timers. "kernels": also one table of the draft
+        # graph's GPU kernels by time, at round 100.
+        self.profile_kernels = os.environ.get("VLLM_UNO_PROF", "0") == "kernels"
+        self.profile = self.profile_kernels or os.environ.get("VLLM_UNO_PROF", "0") == "1"
         self._prof = [0.0, 0.0, 0.0, 0]
+        self._laps: dict[str, float] = {}
+        self._lap_start = 0.0
 
         max_sampled = self.max_num_reqs * self.block
         self.sample_indices = torch.zeros(max_sampled, dtype=torch.int64, device=device)
@@ -176,16 +203,29 @@ class UnoSpeculator(DraftModelSpeculator):
             self.row_mask,
             self.device,
             None if self.lora_dtype == "float32" else self.dtype,
+            (lambda weight: draft_linear(weight, self.draft_weights))
+            if self.draft_weights
+            else None,
+            fold=self.fold_lora == "1" or (self.fold_lora == "auto" and self.draft_weights == "fp8"),
+            block=self.block if self.draft_weights else None,
+            max_rows=self.draft_weights_max_rows if self.draft_weights else None,
         )
+        norms = [
+            norm
+            for layer in layers
+            for norm in (layer.input_layernorm, layer.post_attention_layernorm)
+        ] + [self.decoder.norm]
+        self.draft_norms = DraftNorms(norms) if self.fused_norms else None
         self.gdn_modules = [
             layer.linear_attn for layer in layers if layer.layer_type == "linear_attention"
         ]
         self.conv_history = self.gdn_modules[0].conv_kernel_size - 1
         logger.info(
             "%s: draft = target (%d layers, %d GDN), block %d, %d adapted modules, "
-            "scale %.1f, adapter %s",
+            "scale %.1f, adapter %s, draft weights %s",
             self._speculator_name, len(layers), len(self.gdn_modules), self.block,
             self.lora.num_modules, scale, self.adapter_path,
+            self.draft_weights or "the target's",
         )
 
     def set_attn(
@@ -464,6 +504,7 @@ class UnoSpeculator(DraftModelSpeculator):
             # VLLM_UNO_DEBUG=nolora drafts with the original weights on every
             # row, to measure what the LoRA costs.
             nullcontext() if self.debug_mode == "nolora" else self.lora.active(),
+            nullcontext() if self.draft_norms is None else self.draft_norms.active(),
         ):
             # The decoder's own layer loop, run directly: its compiled forward
             # is traced for the runner's argument pattern.
@@ -497,6 +538,42 @@ class UnoSpeculator(DraftModelSpeculator):
         torch.cuda.synchronize()
         return time.perf_counter()
 
+    def _lap(self, name: str) -> None:
+        """Charge the time since the last lap (or tick) to `name`."""
+        if not self.profile:
+            return
+        torch.cuda.synchronize()
+        now = time.perf_counter()
+        self._laps[name] = self._laps.get(name, 0.0) + now - self._lap_start
+        self._lap_start = now
+
+    def _log_kernel_table(self, batch_desc, replays: int = 5) -> None:
+        """Replay the draft graph under the profiler and log its kernels by time.
+
+        Replaying is harmless: the draft forward leaves committed state alone
+        and its inputs sit in the buffers.
+        """
+        from torch.profiler import ProfilerActivity, profile
+
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            for _ in range(replays):
+                self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            torch.cuda.synchronize()
+        averages = prof.key_averages()
+        try:
+            table = averages.table(
+                sort_by="self_cuda_time_total", row_limit=45, max_name_column_width=100
+            )
+        except (AttributeError, KeyError):
+            table = averages.table(
+                sort_by="self_device_time_total", row_limit=45, max_name_column_width=100
+            )
+        logger.info(
+            "%s: draft graph kernels over %d replays (%d rows):\n%s",
+            self._speculator_name, replays, batch_desc.num_tokens, table,
+        )
+
     # ---- the round ----
     @torch.inference_mode()
     def propose(
@@ -523,7 +600,7 @@ class UnoSpeculator(DraftModelSpeculator):
         if dummy_run or is_profile or self.debug_mode == "null":
             self.draft_tokens[:num_reqs].zero_()
             return self.draft_tokens[:num_reqs]
-        t0 = self._tick()
+        t0 = self._lap_start = self._tick()
 
         # Inputs for [seed, placeholder x (K-1)] per request: ids, positions,
         # sequence lengths, K/V slots in the request's own pages, and the
@@ -560,6 +637,7 @@ class UnoSpeculator(DraftModelSpeculator):
                 max_model_len=self.max_model_len,
                 sample_from_anchor=True,
             )
+        self._lap("inputs")
         # Rows at or past the context limit must not write K/V: the kernel
         # would wrap them onto committed slots of the request's last block.
         seed_pos = draft_seed_positions(
@@ -582,8 +660,10 @@ class UnoSpeculator(DraftModelSpeculator):
 
         # A request that sampled nothing this step is still prefilling: its
         # rows run, but against null state blocks.
+        self._lap("limit+noise")
         active = num_sampled[:num_reqs] > 0
         self._prepare_state_tables(input_batch, active)
+        self._lap("state tables")
 
         batch_desc, batch_sync = dispatch_cg_and_sync_dp(
             self.query_cudagraph_manager,
@@ -603,12 +683,15 @@ class UnoSpeculator(DraftModelSpeculator):
                 self.rope_state.prefill_delta.gpu[input_batch.idx_mapping.to(torch.int64)],
                 block,
             )
+        self._lap("dispatch+positions")
         draft_attn_metadata = self._build_draft_attn_metadata(
             num_reqs, batch_desc, input_batch.seq_lens_cpu_upper_bound
         )
+        self._lap("attn metadata")
         draft_slot_mappings = build_slot_mappings_by_layer(
             self.block_tables.slot_mappings[:, :num_tokens_padded], self.kv_cache_config
         )
+        self._lap("slot mappings")
 
         snaps = (
             self._snapshot_committed(num_reqs, seed_pos) if self.debug_mode == "check" else None
@@ -638,14 +721,21 @@ class UnoSpeculator(DraftModelSpeculator):
             if self._prof[3] % 200 == 0:
                 logger.info(
                     "%s: per round, prepare %.2f ms, draft forward %.2f ms (%d rounds, "
-                    "LoRA %s, debug %r)",
+                    "LoRA %s, debug %r); prepare by stage, ms: %s",
                     self._speculator_name,
                     1e3 * self._prof[0] / self._prof[3],
                     1e3 * self._prof[1] / self._prof[3],
                     self._prof[3],
                     self.lora_dtype,
                     self.debug_mode,
+                    {k: round(1e3 * v / self._prof[3], 2) for k, v in self._laps.items()},
                 )
+            if (
+                self.profile_kernels
+                and self._prof[3] == 100
+                and batch_desc.cg_mode == CUDAGraphMode.FULL
+            ):
+                self._log_kernel_table(batch_desc)
         if snaps is not None:
             self._assert_untouched(
                 snaps, self.model_state.num_accepted_tokens_gpu[input_batch.idx_mapping]
