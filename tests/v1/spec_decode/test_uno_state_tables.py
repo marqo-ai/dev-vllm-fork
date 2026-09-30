@@ -56,3 +56,38 @@ def test_blocks_wider_than_the_table_are_ignored():
 def test_a_table_too_narrow_for_a_scratch_block_is_rejected():
     with pytest.raises(ValueError, match="num_speculative_tokens >= 2"):
         build_draft_state_table(torch.ones(1, 2, dtype=torch.int32), torch.tensor([1]), torch.tensor([True]), 2)
+
+
+@pytest.mark.parametrize("dim_first", [True, False])
+def test_conv_history_is_copied_to_the_scratch_block_at_the_read_offset(dim_first):
+    from vllm.v1.worker.gpu.spec_decode.uno.state_tables import stage_conv_windows
+
+    torch.manual_seed(0)
+    blocks, dim, history = 8, 5, 3
+    state_len = history + WIDTH - 1
+    shape = (blocks, dim, state_len) if dim_first else (blocks, state_len, dim)
+    conv = torch.randn(shape)
+    before = conv.clone()
+    src, dst, off = torch.tensor([1, 4]), torch.tensor([2, 6]), torch.tensor([0, 5])
+
+    stage_conv_windows([conv], src, dst, off, WIDTH - 1, history, dim_first)
+
+    def window(tensor, block, start):
+        return tensor[block, :, start:start + history] if dim_first else tensor[block, start:start + history]
+
+    assert torch.equal(window(conv, 2, WIDTH - 1), window(before, 1, 0))
+    assert torch.equal(window(conv, 6, WIDTH - 1), window(before, 4, 5))
+    untouched = [0, 1, 3, 4, 5, 7]
+    assert torch.equal(conv[untouched], before[untouched])
+    head = (slice(None), slice(0, WIDTH - 1)) if dim_first else (slice(0, WIDTH - 1),)
+    assert torch.equal(conv[2][head], before[2][head])
+
+
+def test_inactive_rows_stage_inside_the_null_block_only():
+    from vllm.v1.worker.gpu.spec_decode.uno.state_tables import stage_conv_windows
+
+    conv = torch.randn(4, 5, 11)
+    before = conv.clone()
+    zero = torch.zeros(2, dtype=torch.int64)
+    stage_conv_windows([conv], zero, zero, zero, WIDTH - 1, 3, True)
+    assert torch.equal(conv[1:], before[1:])

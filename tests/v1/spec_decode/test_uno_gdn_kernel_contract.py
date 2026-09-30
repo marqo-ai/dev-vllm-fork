@@ -7,7 +7,10 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_upd
 from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from vllm.v1.worker.gpu.spec_decode.uno.state_tables import build_draft_state_table
+from vllm.v1.worker.gpu.spec_decode.uno.state_tables import (
+    build_draft_state_table,
+    stage_conv_windows,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -72,9 +75,7 @@ def test_conv_kernel_reads_the_staged_window_and_never_writes_block_zero(accepte
         num_accepted_tokens=acc, query_start_loc=qsl, max_query_len=WIDTH)
 
     draft_conv = conv.clone()
-    steps = torch.arange(hist, device=DEV)
-    window = draft_conv[src[:, None], :, off[:, None] + steps[None, :]]
-    draft_conv[dst[:, None], :, (WIDTH - 1) + steps[None, :]] = window
+    stage_conv_windows([draft_conv], src, dst, off, WIDTH - 1, hist, True)
     draft_out = causal_conv1d_update(
         x.clone(), draft_conv, weight, bias, "silu", conv_state_indices=table[:, 0].contiguous(),
         num_accepted_tokens=torch.full((N,), WIDTH, dtype=torch.int32, device=DEV),

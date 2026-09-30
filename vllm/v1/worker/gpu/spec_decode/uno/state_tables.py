@@ -60,3 +60,30 @@ def build_draft_state_table(
         torch.where(active, scratch, zero),
         torch.where(active, committed_col, zero),
     )
+
+
+def stage_conv_windows(
+    conv_states: list[torch.Tensor],
+    src_block: torch.Tensor,
+    dst_block: torch.Tensor,
+    src_offset: torch.Tensor,
+    dst_offset: int,
+    history: int,
+    dim_first: bool,
+) -> None:
+    """Copy each request's committed convolution history into its scratch block.
+
+    `conv_states` holds one tensor per GDN layer, `[blocks, dim, state_len]` when
+    `dim_first`, else `[blocks, state_len, dim]`. Entries
+    `[src_offset, src_offset + history)` of `src_block` go to entries
+    `[dst_offset, dst_offset + history)` of `dst_block`, which is where the
+    convolution kernel reads when `num_accepted_tokens = dst_offset + 1`.
+    """
+    steps = torch.arange(history, device=src_block.device)
+    src_tokens = src_offset[:, None] + steps[None, :]
+    dst_tokens = (dst_offset + steps)[None, :]
+    for conv in conv_states:
+        if dim_first:
+            conv[dst_block[:, None], :, dst_tokens] = conv[src_block[:, None], :, src_tokens]
+        else:
+            conv[dst_block[:, None], dst_tokens] = conv[src_block[:, None], src_tokens]

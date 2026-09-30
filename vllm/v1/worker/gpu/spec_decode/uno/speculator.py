@@ -47,7 +47,10 @@ from vllm.v1.worker.gpu.spec_decode.uno.isolation import (
     changed_slots,
     kv_block_view,
 )
-from vllm.v1.worker.gpu.spec_decode.uno.state_tables import build_draft_state_table
+from vllm.v1.worker.gpu.spec_decode.uno.state_tables import (
+    build_draft_state_table,
+    stage_conv_windows,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
@@ -109,8 +112,6 @@ class UnoSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.state_tables: dict[int, torch.Tensor] = {}
         self.stage: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-        self.conv_states: dict[int, list[torch.Tensor]] | None = None
-        self.attention_caches: dict[int, list[torch.Tensor]] | None = None
         self._checked_rounds = 0
         self._accepted_hist = torch.zeros(self.state_width + 1, dtype=torch.int64, device=device)
 
@@ -138,7 +139,6 @@ class UnoSpeculator(DraftModelSpeculator):
             layer.linear_attn for layer in layers if layer.layer_type == "linear_attention"
         ]
         self.conv_history = self.gdn_modules[0].conv_kernel_size - 1
-        self.history_steps = torch.arange(self.conv_history, device=self.device)
         logger.info(
             "%s: draft = target (%d layers, %d GDN), block %d, %d adapted modules, "
             "scale %.1f, adapter %s",
@@ -219,33 +219,27 @@ class UnoSpeculator(DraftModelSpeculator):
         )
 
     # ---- GDN state ----
-    def _bind_conv_states(self) -> dict[int, list[torch.Tensor]]:
-        """Collect each GDN layer's convolution-state tensor, by KV group.
-
-        KV caches are bound to layers after set_attn, so this runs lazily.
-        """
-        if self.conv_states is None:
-            bound: dict[int, list[torch.Tensor]] = {gid: [] for gid in self.mamba_gids}
-            for module in self.gdn_modules:
-                bound[self.gid_of_layer[module.prefix]].append(module.kv_cache[0])
-            self.conv_states = bound
-        return self.conv_states
-
     def _stage_conv_windows(self, num_reqs: int) -> None:
         """Copy each request's committed convolution history into its scratch
         block, at the offset the kernel reads when num_accepted == state_width."""
-        dst_tokens = (self.state_width - 1) + self.history_steps
         dim_first = is_conv_state_dim_first()
-        for gid, conv_states in self._bind_conv_states().items():
+        for gid in self.mamba_gids:
             src_block, dst_block, src_offset = (b[:num_reqs] for b in self.stage[gid])
-            src_tokens = src_offset[:, None] + self.history_steps[None, :]
-            for conv in conv_states:
-                if dim_first:  # [blocks, dim, state_len]
-                    window = conv[src_block[:, None], :, src_tokens]
-                    conv[dst_block[:, None], :, dst_tokens[None, :]] = window
-                else:  # [blocks, state_len, dim]
-                    window = conv[src_block[:, None], src_tokens]
-                    conv[dst_block[:, None], dst_tokens[None, :]] = window
+            stage_conv_windows(
+                # Resolved on every call, never cached: vLLM builds a temporary
+                # KV cache for memory profiling and replaces it afterwards.
+                [
+                    module.kv_cache[0]
+                    for module in self.gdn_modules
+                    if self.gid_of_layer[module.prefix] == gid
+                ],
+                src_block,
+                dst_block,
+                src_offset,
+                self.state_width - 1,
+                self.conv_history,
+                dim_first,
+            )
 
     def _prepare_state_tables(
         self, input_batch: InputBatch, active: torch.Tensor
@@ -264,17 +258,15 @@ class UnoSpeculator(DraftModelSpeculator):
                 buffer[:num_reqs] = value
 
     # ---- VLLM_UNO_DEBUG=check: the draft forward must leave no trace ----
-    def _bind_attention_caches(self) -> dict[int, list[torch.Tensor]]:
-        if self.attention_caches is None:
-            bound: dict[int, list[torch.Tensor]] = {gid: [] for gid in self.attn_gids}
-            layers = get_layers_from_vllm_config(self.vllm_config, Attention)
-            for name, layer in layers.items():
-                kv = layer.kv_cache
-                kv = kv[0] if isinstance(kv, (list, tuple)) else kv
-                if self.gid_of_layer.get(name) in bound and kv.numel():
-                    bound[self.gid_of_layer[name]].append(kv)
-            self.attention_caches = bound
-        return self.attention_caches
+    def _attention_caches(self, gid: int) -> list[torch.Tensor]:
+        caches = []
+        layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        for name, layer in layers.items():
+            kv = layer.kv_cache
+            kv = kv[0] if isinstance(kv, (list, tuple)) else kv
+            if self.gid_of_layer.get(name) == gid and kv.numel():
+                caches.append(kv)
+        return caches
 
     def _snapshot_committed(self, num_reqs: int) -> list[tuple]:
         """Copy every state block and K/V slot the draft forward must not change.
@@ -316,7 +308,7 @@ class UnoSpeculator(DraftModelSpeculator):
                 rows[in_range], (positions // block_size)[in_range], (positions % block_size)[in_range]
             ] = True
             allowed = allowed.reshape(-1, block_size) | (blocks == 0)[:, None]
-            for kv in self._bind_attention_caches()[gid]:
+            for kv in self._attention_caches(gid):
                 view = kv_block_view(kv, self.kv_cache_config.num_blocks, block_size)
                 before = view.index_select(0, blocks).clone()
                 snaps.append((f"attention K/V (group {gid})", view, blocks, allowed, before))
