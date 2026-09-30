@@ -21,10 +21,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.worker.gpu.attn_utils import (
@@ -41,6 +42,11 @@ from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManag
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import prepare_dflash_inputs
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.uno.gated_lora import GatedLoRA, load_uno_adapter
+from vllm.v1.worker.gpu.spec_decode.uno.isolation import (
+    changed_blocks,
+    changed_slots,
+    kv_block_view,
+)
 from vllm.v1.worker.gpu.spec_decode.uno.state_tables import build_draft_state_table
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -104,6 +110,9 @@ class UnoSpeculator(DraftModelSpeculator):
         self.state_tables: dict[int, torch.Tensor] = {}
         self.stage: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self.conv_states: dict[int, list[torch.Tensor]] | None = None
+        self.attention_caches: dict[int, list[torch.Tensor]] | None = None
+        self._checked_rounds = 0
+        self._accepted_hist = torch.zeros(self.state_width + 1, dtype=torch.int64, device=device)
 
     # ---- model: the draft is the target ----
     def load_draft_model(
@@ -253,6 +262,87 @@ class UnoSpeculator(DraftModelSpeculator):
             for buffer, value in zip(self.stage[gid], (src_block, dst_block, src_offset)):
                 buffer.zero_()
                 buffer[:num_reqs] = value
+
+    # ---- VLLM_UNO_DEBUG=check: the draft forward must leave no trace ----
+    def _bind_attention_caches(self) -> dict[int, list[torch.Tensor]]:
+        if self.attention_caches is None:
+            bound: dict[int, list[torch.Tensor]] = {gid: [] for gid in self.attn_gids}
+            layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+            for name, layer in layers.items():
+                kv = layer.kv_cache
+                kv = kv[0] if isinstance(kv, (list, tuple)) else kv
+                if self.gid_of_layer.get(name) in bound and kv.numel():
+                    bound[self.gid_of_layer[name]].append(kv)
+            self.attention_caches = bound
+        return self.attention_caches
+
+    def _snapshot_committed(self, num_reqs: int) -> list[tuple]:
+        """Copy every state block and K/V slot the draft forward must not change.
+
+        Allowed to change: each request's scratch state block, the K/V slots at
+        its draft positions, and the null block.
+        """
+        block = self.block
+        first_pos = self.input_buffers.positions[: num_reqs * block].view(num_reqs, block)[:, 0]
+        snaps: list[tuple] = []
+        for gid in self.mamba_gids:
+            real = self.block_tables.input_block_tables[gid][:num_reqs, : self.state_width]
+            real = real.to(torch.int64)
+            blocks = real.reshape(-1)
+            scratch = self.stage[gid][1][:num_reqs]
+            allowed = (real == scratch[:, None]).reshape(-1) | (blocks == 0)
+            for module in self.gdn_modules:
+                if self.gid_of_layer[module.prefix] != gid:
+                    continue
+                for which, state in zip(("conv", "recurrent"), module.kv_cache):
+                    before = state.index_select(0, blocks).clone()
+                    snaps.append((f"{module.prefix} {which} state", state, blocks, allowed, before))
+        for gid in self.attn_gids:
+            block_size = int(self.block_tables.kernel_block_sizes[gid])
+            table = self.block_tables.input_block_tables[gid][:num_reqs].to(torch.int64)
+            last_col = (first_pos + block - 1) // block_size
+            num_cols = min(int(last_col.max().item()) + 1, table.shape[1])
+            cols = torch.arange(num_cols, device=self.device)
+            # Columns past a request's last draft position can hold stale ids.
+            owned = cols[None, :] <= last_col[:, None]
+            blocks = torch.where(owned, table[:, :num_cols], 0).reshape(-1)
+            positions = first_pos[:, None] + torch.arange(block, device=self.device)[None, :]
+            rows = torch.arange(num_reqs, device=self.device)[:, None].expand_as(positions)
+            in_range = positions // block_size < num_cols
+            allowed = torch.zeros(
+                num_reqs, num_cols, block_size, dtype=torch.bool, device=self.device
+            )
+            allowed[
+                rows[in_range], (positions // block_size)[in_range], (positions % block_size)[in_range]
+            ] = True
+            allowed = allowed.reshape(-1, block_size) | (blocks == 0)[:, None]
+            for kv in self._bind_attention_caches()[gid]:
+                view = kv_block_view(kv, self.kv_cache_config.num_blocks, block_size)
+                before = view.index_select(0, blocks).clone()
+                snaps.append((f"attention K/V (group {gid})", view, blocks, allowed, before))
+        return snaps
+
+    def _assert_untouched(self, snaps: list[tuple], accepted: torch.Tensor) -> None:
+        for name, tensor, blocks, allowed, before in snaps:
+            after = tensor.index_select(0, blocks)
+            compare = changed_blocks if allowed.ndim == 1 else changed_slots
+            bad = compare(before, after) & ~allowed
+            if bool(bad.any()):
+                raise RuntimeError(
+                    f"Uno draft forward changed committed state: {name}, at "
+                    f"{bad.nonzero()[:8].tolist()} of blocks {blocks.tolist()}"
+                )
+        self._accepted_hist += torch.bincount(
+            accepted.to(torch.int64).clamp(0, self.state_width), minlength=self.state_width + 1
+        )
+        self._checked_rounds += 1
+        if self._checked_rounds % 200 == 0:
+            logger.info(
+                "%s: isolation check passed for %d rounds (%d tensors per round); "
+                "num_accepted histogram %s",
+                self._speculator_name, self._checked_rounds, len(snaps),
+                self._accepted_hist.tolist(),
+            )
 
     # ---- attention metadata ----
     def _build_draft_attn_metadata(
@@ -464,6 +554,8 @@ class UnoSpeculator(DraftModelSpeculator):
             self.block_tables.slot_mappings[:, :num_tokens_padded], self.kv_cache_config
         )
 
+        snaps = self._snapshot_committed(num_reqs) if self.debug_mode == "check" else None
+
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
             self.query_cudagraph_manager.run_fullgraph(batch_desc)
@@ -479,6 +571,10 @@ class UnoSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
 
+        if snaps is not None:
+            self._assert_untouched(
+                snaps, self.model_state.num_accepted_tokens_gpu[input_batch.idx_mapping]
+            )
         if self.debug_mode == "discard":
             self.draft_tokens[:num_reqs].zero_()
         return self.draft_tokens[:num_reqs]
