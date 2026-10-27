@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Marqo in 2026 to add the Uno speculative decoding method.
 
 import copy
 import getpass
