@@ -753,7 +753,7 @@ pyarrow==23.0.0
     # via
     #   datasets
     #   genai-perf
-pyasn1==0.6.1
+pyasn1==0.6.5
     # via
     #   pyasn1-modules
     #   rsa
